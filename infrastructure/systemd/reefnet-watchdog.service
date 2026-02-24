@@ -1,0 +1,19 @@
+[Unit]
+Description=ReefNet WiFi watchdog (recovers hostapd/dnsmasq)
+After=network-online.target
+Wants=network-online.target
+Requires=hostapd.service dnsmasq.service
+
+[Service]
+Type=simple
+Environment=AP_IFACE=wlan1
+Environment=AP_ADDR=192.168.4.1/24
+Environment=CHECK_INTERVAL=5
+Environment=STARTUP_SCRIPT=/usr/local/sbin/reefnet-startup.sh
+Environment=DOCKER_DIR=/home/fluff/PickleReef
+ExecStart=/usr/local/sbin/reefnet-watchdog.sh
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

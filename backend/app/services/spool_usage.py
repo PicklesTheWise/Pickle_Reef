@@ -1,0 +1,103 @@
+from __future__ import annotations
+
+from datetime import datetime
+from typing import Any
+
+import logging
+
+from ..db import SessionLocal
+from ..schemas.spool_usage import SpoolUsageLog
+
+logger = logging.getLogger(__name__)
+
+DEFAULT_SPOOL_LENGTH_MM = 50_000
+
+
+async def record_spool_usage_entry(
+    module_id: str,
+    delta_edges: float,
+    delta_mm: float,
+    total_used_edges: float,
+    timestamp: datetime | None = None,
+) -> None:
+    async with SessionLocal() as session:
+        entry = SpoolUsageLog(
+            module_id=module_id,
+            delta_edges=delta_edges,
+            delta_mm=delta_mm,
+            total_used_edges=total_used_edges,
+            recorded_at=timestamp or datetime.utcnow(),
+        )
+        session.add(entry)
+        await session.commit()
+
+
+def derive_spool_usage_delta(
+    module_id: str,
+    previous_spool: dict[str, Any] | None,
+    current_spool: dict[str, Any] | None,
+    config_spool: dict[str, Any] | None,
+) -> dict[str, float] | None:
+    if not current_spool:
+        return None
+
+    full_edges = _resolve_numeric([current_spool, config_spool], "full_edges")
+    if not full_edges or full_edges <= 0:
+        return None
+
+    total_length = _resolve_numeric(
+        [current_spool, config_spool],
+        ["total_length_mm", "length_mm"],
+        fallback=DEFAULT_SPOOL_LENGTH_MM,
+    )
+    if not total_length or total_length <= 0:
+        return None
+
+    mm_per_edge = total_length / full_edges
+
+    current_used = _resolve_used_edges(current_spool, full_edges)
+    previous_used = _resolve_used_edges(previous_spool, full_edges) if previous_spool else None
+
+    if current_used is None or previous_used is None:
+        return None
+
+    delta_edges = current_used - previous_used
+    if delta_edges <= 0:
+        return None
+
+    delta_mm = delta_edges * mm_per_edge
+    # Guard against implausible spikes (e.g., re-threading) by dropping deltas that exceed a full roll.
+    if delta_mm > total_length:
+        logger.debug("Skipping spool delta for %s exceeding total length", module_id)
+        return None
+
+    return {
+        "delta_edges": float(delta_edges),
+        "delta_mm": float(delta_mm),
+        "total_used_edges": float(current_used),
+    }
+
+
+def _resolve_numeric(sources: list[dict[str, Any] | None], keys: str | list[str], fallback: float | None = None):
+    if isinstance(keys, str):
+        keys = [keys]
+    for source in sources:
+        if not source:
+            continue
+        for key in keys:
+            value = source.get(key)
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                return float(value)
+    return fallback
+
+
+def _resolve_used_edges(spool: dict[str, Any] | None, full_edges: float | None) -> float | None:
+    if not spool:
+        return None
+    used = spool.get("used_edges")
+    if isinstance(used, (int, float)) and not isinstance(used, bool):
+        return float(used)
+    remaining = spool.get("remaining_edges")
+    if isinstance(remaining, (int, float)) and not isinstance(remaining, bool) and full_edges:
+        return float(max(0.0, full_edges - remaining))
+    return None

@@ -1,0 +1,37 @@
+version: "3.9"
+services:
+  api:
+    build: ./backend
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    environment:
+      API_HOST: 0.0.0.0
+      API_PORT: 8000
+      DATABASE_URL: sqlite+aiosqlite:///./data/pickle_reef.db
+      MQTT_HOST: mqtt
+      MQTT_PORT: 1883
+      MQTT_TOPIC_PREFIX: pickle-reef
+      WS_TRACE: "1"
+    volumes:
+      - ./backend/app:/app/app
+      - ./backend/data:/app/data
+      - ./backend/.env:/app/.env:ro
+    ports:
+      - "80:8000"
+      - "8000:8000"
+    depends_on:
+      - mqtt
+
+  frontend:
+    build: ./frontend
+    ports:
+      - "5173:80"
+    depends_on:
+      - api
+
+  mqtt:
+    image: eclipse-mosquitto:2
+    ports:
+      - "1883:1883"
+      - "9001:9001"
+    volumes:
+      - ./infrastructure/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
