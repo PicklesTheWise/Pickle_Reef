@@ -9,6 +9,8 @@ from ..services.connection_manager import manager
 from ..core.config import settings
 from ..services.cycle_log import record_cycle_log
 from ..services.module_status import (
+    apply_spool_activations,
+    apply_spool_tick,
     mark_module_offline,
     record_module_alarm,
     upsert_module_config,
@@ -87,6 +89,10 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
             elif msg_type == "alarm":
                 await record_module_alarm(payload)
                 logger.info("Alarm event from %s: %s", module_id or "unknown", payload)
+            elif msg_type in {"spool_activations", "spool_tick"}:
+                handler = apply_spool_activations if msg_type == "spool_activations" else apply_spool_tick
+                await handler(payload)
+                logger.info("Spool activations update from %s: %s", module_id or "unknown", payload)
             else:
                 logger.debug("Unhandled module message: %s", payload)
     except WebSocketDisconnect:

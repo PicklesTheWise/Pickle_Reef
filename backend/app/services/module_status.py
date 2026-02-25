@@ -34,6 +34,20 @@ async def upsert_module_status(payload: dict[str, Any], client_ip: str | None = 
         module.status = "online"
         module.last_seen = datetime.utcnow()
         current_spool = payload.get("spool") if isinstance(payload, dict) else None
+
+        if isinstance(module.status_payload, dict):
+            current_payload = dict(module.status_payload)
+        else:
+            current_payload = {}
+
+        if isinstance(current_payload.get("spool"), dict) and isinstance(current_spool, dict):
+            merged_spool = {**current_payload["spool"], **current_spool}
+            payload = {**payload, "spool": merged_spool}
+            current_spool = merged_spool
+        elif isinstance(current_payload.get("spool"), dict) and not current_spool:
+            payload = {**payload, "spool": current_payload["spool"]}
+            current_spool = current_payload["spool"]
+
         module.status_payload = payload
         module.ip_address = client_ip or module.ip_address
         if current_spool:
@@ -83,6 +97,49 @@ async def upsert_module_config(module_id: str, payload: dict[str, Any]) -> Modul
         await session.commit()
         await session.refresh(module)
         return module
+
+
+async def apply_spool_activations(payload: dict[str, Any]) -> None:
+    """Merge lightweight spool telemetry (activations, percent remaining, etc.)."""
+
+    module_id = payload.get("module")
+    if not module_id:
+        return
+
+    spool_fragment = payload.get("spool") if isinstance(payload.get("spool"), dict) else {}
+
+    # Accept top-level helpers for firmware that omits the nested object.
+    for key in ("activations", "percent_remaining", "used_edges", "remaining_edges", "empty_alarm"):
+        if key in payload and key not in spool_fragment:
+            spool_fragment[key] = payload[key]
+
+    if "activations" not in spool_fragment and "count" in payload:
+        spool_fragment["activations"] = payload["count"]
+
+    if not spool_fragment:
+        return
+
+    async with SessionLocal() as session:
+        result = await session.exec(select(ModuleStatus).where(ModuleStatus.module_id == module_id))
+        module = result.first()
+
+        if module is None:
+            module = ModuleStatus(module_id=module_id, label=module_id)
+
+        existing_payload = module.status_payload if isinstance(module.status_payload, dict) else {}
+        current_spool = existing_payload.get("spool") if isinstance(existing_payload.get("spool"), dict) else {}
+        merged_spool = {**current_spool, **spool_fragment}
+        module.status_payload = {**existing_payload, "spool": merged_spool}
+        module.last_seen = datetime.utcnow()
+        module.status = module.status or "online"
+        session.add(module)
+        await session.commit()
+
+
+async def apply_spool_tick(payload: dict[str, Any]) -> None:
+    """Backward-compatible shim for modules still sending spool_tick."""
+
+    await apply_spool_activations(payload)
 
 
 async def record_module_alarm(payload: dict[str, Any]) -> None:

@@ -24,12 +24,14 @@ This guide condenses the WiFi/WebSocket protocol, module firmware expectations, 
 | `config` | Module → Display | Full parameter snapshot (motor window, ATO mode, chirp cadence, spool geometry) pushed after connect or any change.
 | `set_param` | Display → Module | Mutate a single setting (speed, runtime, pump timeout, ATO mode, spool calibration helpers, alarm cadence, etc.).
 | `cycle_log` | Module → Display | Emits immediately when a roller or pump cycle ends so historical charts never miss short events.
+| `spool_activations` | Module → Display | 1 Hz counter of float-triggered advances since the last `spool_reset`; piggybacks on every status broadcast so dashboards never miss increments.
 | `alarm` | Module → Display | Raised/cleared for `pump_timeout` and `roller_empty`; carries severity, message copy, and optional metadata (timeout runtime, floats, etc.).
 
 > **Reminder cadence**: Every alarm feeds the universal chirp loop. `system.alarm_chirp_interval_ms` (30 000–600 000 ms) defines how often the buzzer repeats until the alarm clears.
 
 ### Spool + Calibration Workflow
 - Spool telemetry exposes encoder-derived `full_edges`, `used_edges`, `percent_remaining`, and a `calibrating` flag so the UI can gate controls per spool.
+- `spool.activations` increments only when the float switch triggers an automatic advance (manual button jogs are ignored) and resets with every `spool_reset`. Firmware mirrors that counter inside each `status` payload and also emits a `spool_activations` frame alongside the heartbeat so UI logs capture every change even if a prior frame was missed.
 - `spool_reset` clears usage counters the second a new roll is installed.
 - Calibration uses a 10 m pull (`spool_calibrate_start` → operator pulls sample → `spool_calibrate_finish` with the full-roll length). Firmware snapshots encoder deltas, recomputes `full_edges`, and republishes config/status to show the new baseline. `spool_calibrate_cancel` or a 5-minute timeout aborts gracefully.
 

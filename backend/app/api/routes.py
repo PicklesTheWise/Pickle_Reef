@@ -14,6 +14,7 @@ from ..services.module_control import apply_module_controls
 from ..services.ws_trace import get_ws_trace, clear_ws_trace
 
 router = APIRouter(prefix="/api", tags=["telemetry"])
+MAX_CYCLE_HISTORY_HOURS = 365 * 24
 
 
 async def get_session() -> AsyncSession:
@@ -118,7 +119,7 @@ async def control_module(module_id: str, payload: ModuleControlRequest):
 async def cycle_history(window_hours: int = 24, session: AsyncSession = Depends(get_session)):
     """Return historical roller and pump cycles within the requested window."""
 
-    clamped_window = max(1, min(window_hours, 24 * 7))
+    clamped_window = max(1, min(window_hours, MAX_CYCLE_HISTORY_HOURS))
     since = datetime.utcnow() - timedelta(hours=clamped_window)
     statement = select(CycleLog).where(CycleLog.recorded_at >= since).order_by(CycleLog.recorded_at)
     result = await session.exec(statement)

@@ -663,7 +663,8 @@ button.danger:disabled {
   font-size: 0.7rem;
 }
 
-.cycle-window button.refresh {
+.cycle-window button.refresh,
+.chart-widget__controls button.refresh {
   border: 1px solid rgba(255, 255, 255, 0.2);
   background: transparent;
   color: var(--text-muted);
@@ -695,6 +696,66 @@ button.danger:disabled {
   background: rgba(72, 229, 194, 0.15);
   color: var(--accent);
   border-color: rgba(72, 229, 194, 0.5);
+}
+
+.chart-widget {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.chart-widget__toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.chart-widget__label small {
+  color: var(--text-muted);
+  text-transform: none;
+  letter-spacing: 0;
+  font-size: 0.75rem;
+}
+
+.chart-widget__controls button.refresh {
+  margin-left: auto;
+}
+
+.chart-widget__body {
+  min-height: 320px;
+  border-radius: 0.85rem;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(2, 7, 16, 0.6);
+  padding: 0.75rem;
+  display: flex;
+  align-items: stretch;
+}
+
+.chart-widget__body > * {
+  flex: 1;
+}
+
+.chart-widget__body :global(.chart-shell) {
+  width: 100%;
+}
+
+.chart-widget__placeholder {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  width: 100%;
+  padding: 0.5rem;
+}
+
+.chart-widget__placeholder .placeholder {
+  margin: 0;
+}
+
+.chart-widget__meta {
+  margin-top: 0.5rem;
 }
 
 .roller-chart {
@@ -745,28 +806,6 @@ button.danger:disabled {
 
 .chart-meta strong {
   font-size: 1.1rem;
-}
-
-.timeline-stats {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
-  gap: 0.75rem;
-  margin: 1rem 0 1.5rem;
-}
-
-.timeline-stats div {
-  border: 1px solid rgba(255, 255, 255, 0.05);
-  border-radius: 0.85rem;
-  padding: 0.85rem;
-  background: rgba(255, 255, 255, 0.02);
-}
-
-.timeline-stats p {
-  margin: 0;
-  color: var(--text-muted);
-  font-size: 0.7rem;
-  letter-spacing: 0.12em;
-  text-transform: uppercase;
 }
 
 .timeline-divider {

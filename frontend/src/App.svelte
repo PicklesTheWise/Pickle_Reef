@@ -10,6 +10,7 @@
     fetchSpoolUsageHistory,
   } from './lib/api'
   import LineChart from './lib/LineChart.svelte'
+  import ChartWidget from './lib/ChartWidget.svelte'
 
   const DEFAULT_RUNTIME = 5000
   const DEFAULT_ROLLER_SPEED = 180
@@ -91,6 +92,12 @@
     { hours: 6 * 30 * 24, label: '6mo', description: 'Rolling last 6 months' },
     { hours: 365 * 24, label: '1yr', description: 'Rolling last year' },
   ]
+  const cycleWindowPresets = usageWindowPresets
+  const toWindowButtons = (presets = []) =>
+    presets.map((preset) => ({ value: preset.hours, label: preset.label, description: preset.description }))
+  const usageWindowButtons = toWindowButtons(usageWindowPresets)
+  const cycleWindowButtons = toWindowButtons(cycleWindowPresets)
+  const MAX_CYCLE_WINDOW_HOURS = usageWindowPresets.at(-1)?.hours ?? 365 * 24
   const defaultUsagePreset = usageWindowPresets.find((preset) => preset.hours === 24) ?? usageWindowPresets[0]
   let usageChartWindowHours = defaultUsagePreset?.hours ?? 24
   let usageChartWindowMs = usageChartWindowHours * HOUR_IN_MS
@@ -100,6 +107,46 @@
   const SPOOL_RESET_STORAGE_KEY = 'pickle-reef::spool-reset-epoch'
   const spoolResetTimestamps = new Map()
   let spoolResetVersion = 0
+  const hiddenModuleIds = new Set(['spoolticktester', 'alarmtester'])
+  const hiddenModuleIdsLower = new Set([...hiddenModuleIds].map((id) => id.toLowerCase()))
+
+  const DEFAULT_OFFICIAL_MODULE_IDS = ['PickleRoller']
+
+  const parseModuleIdList = (raw) => {
+    if (typeof raw !== 'string') return []
+    return raw
+      .split(',')
+      .map((id) => id.trim())
+      .filter(Boolean)
+  }
+
+  const resolveOfficialModuleIds = () => {
+    const envValue = import.meta.env?.VITE_OFFICIAL_MODULE_IDS
+    if (typeof envValue === 'string') {
+      const parsed = parseModuleIdList(envValue)
+      if (parsed.length === 1 && parsed[0] === '*') {
+        return []
+      }
+      if (parsed.length) {
+        return parsed
+      }
+      return []
+    }
+    return DEFAULT_OFFICIAL_MODULE_IDS
+  }
+
+  const officialModuleIdsLower = new Set(resolveOfficialModuleIds().map((id) => id.toLowerCase()))
+
+  const shouldDisplayModule = (module) => {
+    const id = (module?.module_id ?? module?.moduleId ?? '').toString().trim()
+    if (!id) return false
+    const normalized = id.toLowerCase()
+    if (hiddenModuleIdsLower.has(normalized)) return false
+    if (officialModuleIdsLower.size && !officialModuleIdsLower.has(normalized)) return false
+    return true
+  }
+
+  const filterDisplayableModules = (list = []) => (list ?? []).filter((module) => shouldDisplayModule(module))
 
   const resolveStorage = () => {
     if (typeof window === 'undefined') return null
@@ -325,6 +372,7 @@
           total_length_mm: 50_000,
           sample_length_mm: 10_000,
           calibrating: false,
+          activations: 128,
         },
       },
       alarms: [
@@ -361,6 +409,7 @@
           total_length_mm: 50_000,
           sample_length_mm: 10_000,
           calibrating: false,
+          activations: 420,
         },
       },
       alarms: [],
@@ -618,9 +667,10 @@
 
       telemetry = telemetryResponse
       summary = summaryResponse
-      modules = moduleResponse
-      detectSpoolResets(moduleResponse)
-      await loadSpoolUsageHistory(moduleResponse)
+      const filteredModules = filterDisplayableModules(moduleResponse)
+      modules = filteredModules
+      detectSpoolResets(filteredModules)
+      await loadSpoolUsageHistory(filteredModules)
       error = ''
       controlError = ''
     } catch (err) {
@@ -628,8 +678,9 @@
       if (!telemetry.length) {
         telemetry = fallbackTelemetry
         summary = deriveSummary(fallbackTelemetry)
-        modules = fallbackModules
-        const fallbackForTracking = fallbackModules.map((module) => ({
+        const demoModules = filterDisplayableModules(fallbackModules)
+        modules = demoModules
+        const fallbackForTracking = demoModules.map((module) => ({
           ...module,
           spool_state: module.status_payload?.spool ?? module.spool ?? {},
         }))
@@ -1242,6 +1293,12 @@
   }
 
   $: moduleCards = modules.map(hydrateModule)
+  $: if (
+    selectedModuleId &&
+    !moduleCards.some((module) => module.module_id === selectedModuleId)
+  ) {
+    selectedModuleId = moduleCards[0]?.module_id ?? ''
+  }
   $: if (!selectedModuleId && moduleCards.length) {
     selectedModuleId = moduleCards[0].module_id
   }
@@ -1297,10 +1354,19 @@
     return selectedModuleUsage.filter((entry) => entry.timestamp >= baseline)
   })()
   $: spoolLifetimeUsageMm = usageEntriesSinceBaseline.reduce((sum, entry) => sum + entry.deltaMm, 0)
-  $: spoolLifetimeActivationCount = usageEntriesSinceBaseline.length
-  $: spoolAverageActivationLengthMm = spoolLifetimeActivationCount
-    ? spoolLifetimeUsageMm / spoolLifetimeActivationCount
-    : 0
+  $: spoolReportedActivations = coalesceNumber(
+    spoolState?.activations,
+    spoolState?.activation_count,
+    spoolState?.activationCount
+  )
+  $: spoolLifetimeActivationCount =
+    typeof spoolReportedActivations === 'number' && Number.isFinite(spoolReportedActivations)
+      ? Math.max(0, Math.round(spoolReportedActivations))
+      : null
+  $: spoolAverageActivationLengthMm =
+    typeof spoolLifetimeActivationCount === 'number' && spoolLifetimeActivationCount > 0
+      ? spoolLifetimeUsageMm / spoolLifetimeActivationCount
+      : null
   $: spoolMetricSubcopy = describeSpoolMetricBaseline(moduleSpoolBaselineMs)
   $: usageChart = (() => {
     const now = Date.now()
@@ -1439,6 +1505,13 @@
   const setUsageChartWindow = (hours) => {
     if (usageChartWindowHours === hours) return
     usageChartWindowHours = hours
+  }
+
+  const setCycleChartWindow = (hours) => {
+    const normalized = Math.max(1, Math.min(hours, MAX_CYCLE_WINDOW_HOURS))
+    if (cycleWindow === normalized) return
+    cycleWindow = normalized
+    loadCycleHistory(normalized)
   }
 
   const refreshCycleHistory = () => {
@@ -1898,44 +1971,31 @@
         <h2>Signal timeline</h2>
       </header>
 
-      <div class="cycle-window">
-        <div class="window-label">
-          <p>Cycle window</p>
-          <button type="button" class="refresh" on:click={refreshCycleHistory} aria-label="Refresh cycle data">
-            ↻
-          </button>
-        </div>
-      </div>
-
       {#if cycleHistoryError}
         <div class="banner warning">{cycleHistoryError}</div>
       {/if}
-
-      <div class="roller-chart usage-chart" aria-label="Estimated filter media usage">
-        <div class="cycle-window usage-window">
-          <div class="window-label">
-            <p>Usage window</p>
-          </div>
-          <div class="window-buttons">
-            {#each usageWindowPresets as preset}
-              <button
-                type="button"
-                class:active={usageChartWindowHours === preset.hours}
-                on:click={() => setUsageChartWindow(preset.hours)}
-              >
-                {preset.label}
-              </button>
-            {/each}
-          </div>
-        </div>
+      <ChartWidget
+        ariaLabel="Estimated filter media usage"
+        label="Usage window"
+        description={describeUsageWindow(usageChartWindowHours)}
+        buttons={usageWindowButtons}
+        activeValue={usageChartWindowHours}
+        on:select={(event) => setUsageChartWindow(event.detail)}
+      >
         {#if !selectedModuleId}
-          <p class="placeholder">Select a module to track filter usage.</p>
+          <div class="chart-widget__placeholder">
+            <p class="placeholder">Select a module to track filter usage.</p>
+          </div>
         {:else if loading && usageChart.points.length === 0}
-          <p class="placeholder">Loading filter usage…</p>
+          <div class="chart-widget__placeholder">
+            <p class="placeholder">Loading filter usage…</p>
+          </div>
         {:else if usageChart.points.length === 0 && usageActivationMarkers.length === 0}
-          <p class="placeholder">
-            No filter movement detected in the last {formatUsageWindowShort(usageChartWindowHours)}.
-          </p>
+          <div class="chart-widget__placeholder">
+            <p class="placeholder">
+              No filter movement detected in the last {formatUsageWindowShort(usageChartWindowHours)}.
+            </p>
+          </div>
         {:else}
           <LineChart
             datasets={usageChartDatasets}
@@ -1952,35 +2012,57 @@
             tickColor="rgba(255, 255, 255, 0.95)"
             gridColor="rgba(255, 255, 255, 0.2)"
           />
-          <div class="chart-meta usage-meta">
-            <div>
-              <p>Media used (spool)</p>
-              <strong>{formatSpoolMediaLength(spoolLifetimeUsageMm)}</strong>
-              <small>{spoolMetricSubcopy}</small>
-            </div>
-            <div>
-              <p>Avg per activation</p>
-              <strong>
-                {spoolLifetimeActivationCount
-                  ? formatSpoolMediaLength(spoolAverageActivationLengthMm)
-                  : '—'}
-              </strong>
-              <small>{spoolMetricSubcopy}</small>
-            </div>
-            <div>
-              <p>Activations (spool)</p>
-              <strong>{spoolLifetimeActivationCount}</strong>
-              <small>{spoolMetricSubcopy}</small>
-            </div>
-          </div>
         {/if}
-      </div>
 
-      <div class="roller-chart">
+        <svelte:fragment slot="meta">
+          {#if selectedModuleId}
+            <div class="chart-meta usage-meta">
+              <div>
+                <p>Media used (spool)</p>
+                <strong>{formatSpoolMediaLength(spoolLifetimeUsageMm)}</strong>
+                <small>{spoolMetricSubcopy}</small>
+              </div>
+              <div>
+                <p>Avg per activation</p>
+                <strong>
+                  {spoolAverageActivationLengthMm != null
+                    ? formatSpoolMediaLength(spoolAverageActivationLengthMm)
+                    : '—'}
+                </strong>
+                <small>{spoolMetricSubcopy}</small>
+              </div>
+              <div>
+                <p>Activations (spool)</p>
+                <strong>{spoolLifetimeActivationCount ?? '—'}</strong>
+                <small>{spoolMetricSubcopy}</small>
+              </div>
+            </div>
+          {/if}
+        </svelte:fragment>
+      </ChartWidget>
+
+      <ChartWidget
+        ariaLabel="ATO cycles chart"
+        label="ATO window"
+        description={describeUsageWindow(activeCycleWindowHours)}
+        buttons={cycleWindowButtons}
+        activeValue={activeCycleWindowHours}
+        on:select={(event) => setCycleChartWindow(event.detail)}
+      >
+        <svelte:fragment slot="controls">
+          <button type="button" class="refresh" on:click={refreshCycleHistory} aria-label="Refresh cycle data">
+            ↻
+          </button>
+        </svelte:fragment>
+
         {#if cycleHistoryLoading}
-          <p class="placeholder">Loading ATO history…</p>
+          <div class="chart-widget__placeholder">
+            <p class="placeholder">Loading ATO history…</p>
+          </div>
         {:else if !atoRuns.length}
-          <p class="placeholder">No ATO activity in this window.</p>
+          <div class="chart-widget__placeholder">
+            <p class="placeholder">No ATO activity in this window.</p>
+          </div>
         {:else}
           <LineChart
             datasets={atoChartDatasets}
@@ -1997,6 +2079,9 @@
             tickColor="rgba(255, 255, 255, 0.95)"
             gridColor="rgba(255, 255, 255, 0.2)"
           />
+        {/if}
+
+        <svelte:fragment slot="meta">
           <div class="chart-meta">
             <div>
               <p>ATO cycles</p>
@@ -2014,26 +2099,8 @@
               <small>Per pump cycle</small>
             </div>
           </div>
-        {/if}
-      </div>
-
-      <div class="timeline-stats">
-        <div>
-          <p>ATO cycles</p>
-          <strong>{atoStats.count}</strong>
-          <small>{atoStats.frequency_per_hour?.toFixed(2) ?? '0.00'} /hr</small>
-        </div>
-        <div>
-          <p>Avg fill time</p>
-          <strong>{formatCycleDuration((atoStats.avg_fill_seconds ?? 0) * 1000)}</strong>
-          <small>Min → Max</small>
-        </div>
-        <div>
-          <p>Avg runtime</p>
-          <strong>{formatCycleDuration(atoStats.avg_duration_ms)}</strong>
-          <small>Per pump cycle</small>
-        </div>
-      </div>
+        </svelte:fragment>
+      </ChartWidget>
 
       <div class="timeline-divider"></div>
 
