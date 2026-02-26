@@ -62,3 +62,17 @@ export function fetchSpoolUsageHistory(windowHours = 72, moduleId) {
   }
   return request(`/spool-usage?${params.toString()}`)
 }
+
+export function deleteModule(moduleId) {
+  if (!moduleId) {
+    return Promise.reject(new Error('Missing module id'))
+  }
+  return fetch(`${API_BASE}/modules/${moduleId}`, {
+    method: 'DELETE',
+  }).then((response) => {
+    if (!response.ok) {
+      throw new Error(`Delete failed: ${response.status}`)
+    }
+    return response.json()
+  })
+}

@@ -142,6 +142,7 @@ AP_ADDR=${AP_ADDR:-192.168.4.1/24}
 AP_NET=${AP_NET:-192.168.4.0/24}
 # Try modern CM762 driver first, fall back to legacy RTL8812AU if present
 AP_DRIVER_MODULES=${AP_DRIVER_MODULES:-"aic8800_fdrv 88XXau"}
+HOSTAPD_CONF=${HOSTAPD_CONF:-/etc/hostapd/hostapd.conf}
 
 wait_for_iface(){
   local iface=$1 timeout=${2:-15} waited=0
@@ -190,6 +191,27 @@ sysctl -w net.ipv4.ip_forward=1 >/dev/null
 ensure_rule(){
   if ! iptables -C "$@" 2>/dev/null; then
     iptables -A "$@"
+  fi
+}
+
+ensure_hostapd_hidden(){
+  local conf=$HOSTAPD_CONF
+  if [[ ! -f $conf ]]; then
+    log "hostapd config $conf missing; cannot enforce hidden SSID"
+    return
+  fi
+
+  if grep -Eq '^\s*ignore_broadcast_ssid\s*=\s*1\b' "$conf"; then
+    log "hostapd already hides SSID"
+    return
+  fi
+
+  if grep -Eq '^\s*ignore_broadcast_ssid\s*=' "$conf"; then
+    log "forcing ignore_broadcast_ssid=1 in $conf"
+    sed -i 's/^\s*ignore_broadcast_ssid\s*=.*/ignore_broadcast_ssid=1/' "$conf"
+  else
+    log "appending ignore_broadcast_ssid=1 to $conf"
+    printf '\nignore_broadcast_ssid=1\n' >>"$conf"
   fi
 }
 
@@ -274,6 +296,7 @@ ensure_service(){
   fi
 }
 
+ensure_hostapd_hidden
 restart_service hostapd.service
 restart_service dnsmasq.service
 

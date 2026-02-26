@@ -1,16 +1,17 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any
+from typing import Any, List
 
 import logging
 
-from ..db import SessionLocal
 from ..schemas.spool_usage import SpoolUsageLog
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_SPOOL_LENGTH_MM = 50_000
+MAX_SPOOL_USAGE_ENTRIES = 5000
+_spool_usage_log: List[SpoolUsageLog] = []
 
 
 async def record_spool_usage_entry(
@@ -20,16 +21,15 @@ async def record_spool_usage_entry(
     total_used_edges: float,
     timestamp: datetime | None = None,
 ) -> None:
-    async with SessionLocal() as session:
-        entry = SpoolUsageLog(
-            module_id=module_id,
-            delta_edges=delta_edges,
-            delta_mm=delta_mm,
-            total_used_edges=total_used_edges,
-            recorded_at=timestamp or datetime.utcnow(),
-        )
-        session.add(entry)
-        await session.commit()
+    entry = SpoolUsageLog(
+        module_id=module_id,
+        delta_edges=delta_edges,
+        delta_mm=delta_mm,
+        total_used_edges=total_used_edges,
+        recorded_at=timestamp or datetime.utcnow(),
+    )
+    _spool_usage_log.append(entry)
+    _prune_spool_usage_entries()
 
 
 def derive_spool_usage_delta(
@@ -76,6 +76,42 @@ def derive_spool_usage_delta(
         "delta_mm": float(delta_mm),
         "total_used_edges": float(current_used),
     }
+
+
+def get_spool_usage_entries(
+    module_id: str | None = None,
+    since: datetime | None = None,
+    limit: int | None = None,
+) -> list[SpoolUsageLog]:
+    entries = _spool_usage_log
+    if module_id:
+        entries = [entry for entry in entries if entry.module_id == module_id]
+    if since:
+        entries = [entry for entry in entries if entry.recorded_at >= since]
+    entries = sorted(entries, key=lambda entry: entry.recorded_at)
+    if limit is not None:
+        return entries[: max(0, limit)]
+    return entries
+
+
+def clear_spool_usage_for_module(module_id: str) -> int:
+    """Remove spool usage rows associated with the module."""
+
+    global _spool_usage_log
+    before = len(_spool_usage_log)
+    _spool_usage_log = [entry for entry in _spool_usage_log if entry.module_id != module_id]
+    return before - len(_spool_usage_log)
+
+
+def reset_spool_usage_entries() -> None:
+    """Testing helper to clear the in-memory history."""
+
+    _spool_usage_log.clear()
+
+
+def _prune_spool_usage_entries() -> None:
+    if len(_spool_usage_log) > MAX_SPOOL_USAGE_ENTRIES:
+        del _spool_usage_log[:-MAX_SPOOL_USAGE_ENTRIES]
 
 
 def _resolve_numeric(sources: list[dict[str, Any] | None], keys: str | list[str], fallback: float | None = None):

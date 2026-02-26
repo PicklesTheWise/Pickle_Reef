@@ -3,7 +3,7 @@ from typing import Any, Literal, Optional
 
 from sqlalchemy import Column, JSON
 from sqlmodel import SQLModel, Field
-from pydantic import ConfigDict
+from pydantic import ConfigDict, model_validator
 
 
 SPOOL_LENGTH_MIN_MM = 10_000
@@ -12,6 +12,8 @@ MEDIA_THICKNESS_MIN_UM = 40
 MEDIA_THICKNESS_MAX_UM = 400
 SPOOL_CORE_DIAMETER_MIN_MM = 12
 SPOOL_CORE_DIAMETER_MAX_MM = 80
+TANK_CAPACITY_MIN_ML = 5_000
+TANK_CAPACITY_MAX_ML = 50_000
 
 
 class ModuleStatus(SQLModel, table=True):
@@ -23,6 +25,7 @@ class ModuleStatus(SQLModel, table=True):
     rssi: int | None = None
     status: str = "offline"
     last_seen: datetime = Field(default_factory=datetime.utcnow, index=True)
+    module_type: str | None = Field(default=None, description="High-level module classification")
     status_payload: dict | None = Field(
         default=None,
         sa_column=Column(JSON, nullable=True),
@@ -51,10 +54,22 @@ class ModuleStatusRead(SQLModel, table=False):
     rssi: int | None = None
     status: str = "offline"
     last_seen: datetime | None = None
+    module_type: str | None = None
     status_payload: dict | None = None
     config_payload: dict | None = None
     alarms: list[dict[str, Any]] | None = None
     spool_state: dict | None = None
+    subsystems: list["ModuleSubsystemDefinition"] | None = None
+
+
+class ModuleSubsystemDefinition(SQLModel, table=False):
+    key: str
+    kind: str = Field(default="roller")
+    label: str | None = None
+    badge_label: str | None = None
+    badge_variant: str | None = None
+    card_suffix: str | None = None
+    enabled: bool = True
 
 
 class ModuleUpdate(SQLModel):
@@ -128,3 +143,41 @@ class ModuleControlRequest(SQLModel):
         default=None,
         description="Abort calibration without persisting changes",
     )
+    ato_tank_capacity_ml: int | None = Field(
+        default=None,
+        ge=TANK_CAPACITY_MIN_ML,
+        le=TANK_CAPACITY_MAX_ML,
+        description="Reservoir capacity in millilitres (5-50 L range)",
+    )
+    ato_tank_level_ml: int | None = Field(
+        default=None,
+        ge=0,
+        le=TANK_CAPACITY_MAX_ML,
+        description="Measured tank level in millilitres after a manual calibration",
+    )
+    ato_tank_refill: bool | None = Field(
+        default=None,
+        description="Momentary flag set after a confirmed full refill",
+    )
+    heater_setpoint_min_c: float | None = Field(
+        default=None,
+        ge=10,
+        le=40,
+        description="Lower bound of the heater hysteresis band (°C)",
+    )
+    heater_setpoint_max_c: float | None = Field(
+        default=None,
+        ge=10,
+        le=40,
+        description="Upper bound of the heater hysteresis band (°C)",
+    )
+
+    @model_validator(mode="after")
+    def validate_setpoint_band(self):
+        if (
+            self.heater_setpoint_min_c is not None
+            and self.heater_setpoint_max_c is not None
+            and self.heater_setpoint_min_c > self.heater_setpoint_max_c
+        ):
+            raise ValueError("heater_setpoint_min_c must be less than or equal to heater_setpoint_max_c")
+        return self

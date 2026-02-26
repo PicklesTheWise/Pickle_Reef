@@ -10,10 +10,10 @@ from ..core.config import settings
 from ..services.cycle_log import record_cycle_log
 from ..services.module_status import (
     apply_spool_activations,
-    apply_spool_tick,
     mark_module_offline,
     record_module_alarm,
     upsert_module_config,
+    upsert_module_manifest,
     upsert_module_status,
 )
 from ..services.ws_trace import record_ws_trace
@@ -56,6 +56,10 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
     await websocket.send_json(config_request)
     if settings.ws_trace:
         record_ws_trace("tx", config_request, module_id)
+    manifest_request = {"type": "module_manifest_request"}
+    await websocket.send_json(manifest_request)
+    if settings.ws_trace:
+        record_ws_trace("tx", manifest_request, module_id)
 
     try:
         while True:
@@ -83,15 +87,17 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
             elif msg_type == "config" and module_id:
                 await upsert_module_config(module_id, payload)
                 logger.info("Config response from %s: %s", module_id, payload)
+            elif msg_type == "module_manifest":
+                await upsert_module_manifest(module_id, payload)
+                logger.info("Manifest update from %s: %s", module_id or "unknown", payload)
             elif msg_type == "cycle_log":
                 await record_cycle_log(payload)
                 logger.info("Cycle log from %s: %s", module_id or "unknown", payload)
             elif msg_type == "alarm":
                 await record_module_alarm(payload)
                 logger.info("Alarm event from %s: %s", module_id or "unknown", payload)
-            elif msg_type in {"spool_activations", "spool_tick"}:
-                handler = apply_spool_activations if msg_type == "spool_activations" else apply_spool_tick
-                await handler(payload)
+            elif msg_type == "spool_activations":
+                await apply_spool_activations(payload)
                 logger.info("Spool activations update from %s: %s", module_id or "unknown", payload)
             else:
                 logger.debug("Unhandled module message: %s", payload)

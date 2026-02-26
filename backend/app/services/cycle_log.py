@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any
+from typing import Any, List
 
-from ..db import SessionLocal
 from ..schemas.cycle import CycleLog
+
+MAX_CYCLE_LOG_ENTRIES = 2000
+_cycle_logs: List[CycleLog] = []
 
 
 async def record_cycle_log(payload: dict[str, Any]) -> CycleLog:
@@ -21,8 +23,26 @@ async def record_cycle_log(payload: dict[str, Any]) -> CycleLog:
         recorded_at=datetime.utcnow(),
     )
 
-    async with SessionLocal() as session:
-        session.add(log)
-        await session.commit()
-        await session.refresh(log)
-        return log
+    _cycle_logs.append(log)
+    _prune_cycle_logs()
+    return log
+
+
+def get_cycle_logs_since(timestamp: datetime) -> List[CycleLog]:
+    return [log for log in _cycle_logs if log.recorded_at >= timestamp]
+
+
+def add_cycle_log_entry(entry: CycleLog) -> None:
+    """Testing helper to append a preconstructed entry."""
+
+    _cycle_logs.append(entry)
+    _prune_cycle_logs()
+
+
+def clear_cycle_logs() -> None:
+    _cycle_logs.clear()
+
+
+def _prune_cycle_logs() -> None:
+    if len(_cycle_logs) > MAX_CYCLE_LOG_ENTRIES:
+        del _cycle_logs[:-MAX_CYCLE_LOG_ENTRIES]

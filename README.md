@@ -99,17 +99,11 @@ infrastructure/   # Mosquitto config
 
 ## Hardware modules (ReefNet Wi-Fi)
 
-- The Raspberry Pi hosts the ReefNet AP on `wlan1` (e.g., USB RTL8812AU dongle) with SSID **ReefNet**, password **ReefController2026**, subnet `192.168.4.0/24`, and IP `192.168.4.1` as described in [system_setup.md](system_setup.md).
-- Run `hostapd` against `/etc/hostapd/hostapd.conf` (interface `wlan1`, channel 6, WPA2) and `dnsmasq` with a DHCP range (`192.168.4.50-150`).
-- Keep `wlan0` (or `eth0`) on your WAN so the Pi retains internet access while ReefNet serves modules.
-- The FastAPI backend now exposes `/ws` for JSON frames from modules and should listen on host port **80** so ESP32 clients can connect via `ws://192.168.4.1/ws`. The Docker Compose file already maps host port `80` → container port `8000`; if running uvicorn manually, either bind to `--port 80` (requires elevated privileges) or add an OS-level proxy from 80 → 8000.
+- The Raspberry Pi hosts the (hidden) ReefNet AP on `wlan1` (e.g., USB RTL8812AU dongle) with SSID **ReefNet**, password **ReefController2026**, subnet `192.168.4.0/24`, and IP `192.168.4.1` as described in [system_setup.md](system_setup.md). Disable broadcasting via `ignore_broadcast_ssid=1` in your hostapd config so the network does not appear in nearby Wi-Fi scans.
+- Run `hostapd` against `/etc/hostapd/hostapd.conf` (interface `wlan1`, channel 6, WPA2, `ignore_broadcast_ssid=1`) and `dnsmasq` with a DHCP range (`192.168.4.50-150`).
 
 ### Access Point stability
 
-- Install the hostapd drop-in from [infrastructure/systemd/hostapd-wlan1.conf](infrastructure/systemd/hostapd-wlan1.conf) into `/etc/systemd/system/hostapd.service.d/wlan1.conf` (create the directory if it does not exist). Reload systemd with `sudo systemctl daemon-reload` afterward. This ensures hostapd only starts once the USB dongle exposes `wlan1` and avoids the repeated crash loop seen during cold boots.
-- Re-running your ReefNet startup script should not restart hostapd if it is already active because that will briefly disconnect every module and reset the WebSocket sessions. Prefer checking status first (`systemctl is-active hostapd`) and only restarting when you intentionally need to recycle the AP.
-- Use [infrastructure/scripts/reefnet-startup.sh](infrastructure/scripts/reefnet-startup.sh) as the reference “one-button” bring-up script. It is idempotent: the helper skips hostapd/dnsmasq restarts when the services are already active, reloads the RTL8812AU driver only when needed, re-applies the static IP on `wlan1`, refreshes NAT/forwarding rules, and finally runs `docker compose up -d` from the repo root. Customize it via environment variables (`WAN_IFACE`, `AP_IFACE`, `AP_DRIVER`, etc.) or copy the logic into your systemd service if you prefer automatic bootstrapping.
-- Install the optional watchdog from [infrastructure/scripts/reefnet-watchdog.sh](infrastructure/scripts/reefnet-watchdog.sh) + [infrastructure/systemd/reefnet-watchdog.service](infrastructure/systemd/reefnet-watchdog.service) so the Pi automatically reinitializes hostapd/dnsmasq if the USB radio drops after a module disconnects.
 
 #### ReefNet AP watchdog
 
@@ -127,7 +121,7 @@ infrastructure/   # Mosquitto config
 	```bash
 	sudo systemctl enable --now reefnet-watchdog.service
 	```
-The watchdog polls `wlan1` every few seconds and re-runs the startup sequence whenever the interface disappears, loses its static address, or either hostapd/dnsmasq exit unexpectedly. This keeps the ReefNet SSID online even if the RTL8812AU driver collapses the radio after a module powers off.
+The watchdog polls `wlan1` every few seconds and re-runs the startup sequence whenever the interface disappears, loses its static address, or either hostapd/dnsmasq exit unexpectedly. This keeps the hidden ReefNet SSID online even if the RTL8812AU driver collapses the radio after a module powers off.
 
 #### UGREEN CM762 / AIC8800 Wi-Fi 6 dongle
 

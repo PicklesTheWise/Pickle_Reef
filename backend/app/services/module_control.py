@@ -85,6 +85,37 @@ async def apply_module_controls(module_id: str, request: ModuleControlRequest) -
     if request.spool_calibrate_cancel:
         commands.append({"type": "set_param", "param": "spool_calibrate_cancel", "value": 1})
 
+    if request.ato_tank_capacity_ml is not None:
+        commands.append({
+            "type": "set_param",
+            "param": "ato_tank_capacity_ml",
+            "value": request.ato_tank_capacity_ml,
+        })
+
+    if request.ato_tank_level_ml is not None:
+        commands.append({
+            "type": "set_param",
+            "param": "ato_tank_level_ml",
+            "value": request.ato_tank_level_ml,
+        })
+
+    if request.ato_tank_refill:
+        commands.append({"type": "set_param", "param": "ato_tank_refill", "value": 1})
+
+    if request.heater_setpoint_min_c is not None:
+        commands.append({
+            "type": "set_param",
+            "param": "heater_setpoint_min_c",
+            "value": request.heater_setpoint_min_c,
+        })
+
+    if request.heater_setpoint_max_c is not None:
+        commands.append({
+            "type": "set_param",
+            "param": "heater_setpoint_max_c",
+            "value": request.heater_setpoint_max_c,
+        })
+
     if not commands:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No control values supplied")
 

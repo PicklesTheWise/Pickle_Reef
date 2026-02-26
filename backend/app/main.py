@@ -8,8 +8,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from .api.routes import router
 from .api.websocket import ws_router
 from .core.config import settings
-from .db import init_db
 from .services.mqtt import mqtt_bootstrap
+from .services.module_status import purge_legacy_modules
 
 
 def _configure_logging() -> None:
@@ -40,7 +40,7 @@ app.include_router(ws_router)
 
 @app.on_event("startup")
 async def startup_event() -> None:
-    await init_db()
+    await purge_legacy_modules()
     asyncio.create_task(mqtt_bootstrap())
 
 

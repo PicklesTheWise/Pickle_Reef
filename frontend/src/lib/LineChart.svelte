@@ -17,6 +17,10 @@
   export let gridColor = 'rgba(248, 251, 255, 0.15)'
   export let fontSize = 12
   export let fontWeight = '600'
+  export let yBeginAtZero = true
+  export let showLegend = false
+  export let yMin = undefined
+  export let yMax = undefined
 
   let canvas
   let chart
@@ -45,7 +49,9 @@
         },
       },
       y: {
-        beginAtZero: true,
+        beginAtZero: yBeginAtZero,
+        min: yMin,
+        max: yMax,
         grid: { color: gridColor, lineWidth: 0.5 },
         ticks: {
           color: tickColor,
@@ -62,7 +68,14 @@
       },
     },
     plugins: {
-      legend: { display: false },
+      legend: {
+        display: showLegend,
+        labels: {
+          color: tickColor,
+          font: { size: fontSize * 0.9, weight: fontWeight },
+          usePointStyle: true,
+        },
+      },
       tooltip: {
         backgroundColor: 'rgba(2, 7, 16, 0.95)',
         borderColor: tickColor,

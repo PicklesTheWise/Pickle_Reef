@@ -8,6 +8,7 @@
     updateModuleControls,
     fetchWsTrace,
     fetchSpoolUsageHistory,
+    deleteModule,
   } from './lib/api'
   import LineChart from './lib/LineChart.svelte'
   import ChartWidget from './lib/ChartWidget.svelte'
@@ -18,14 +19,17 @@
   const DEFAULT_ALARM_CHIRP_INTERVAL_MS = 120000
   const DEFAULT_SPOOL_LENGTH_MM = 50000
   const DEFAULT_CORE_DIAMETER_MM = 19
+  const DEFAULT_MEDIA_THICKNESS_UM = 100
+  const DEFAULT_TANK_CAPACITY_ML = 15000
+  const FLOW_ML_PER_MS = 0.0375
   const SPOOL_LENGTH_MIN_MM = 10000
   const SPOOL_LENGTH_MAX_MM = 200000
   const SPOOL_SAMPLE_MM = 10000
-  const DEFAULT_MEDIA_THICKNESS_UM = 100
   const MEDIA_THICKNESS_MIN_UM = 40
   const MEDIA_THICKNESS_MAX_UM = 400
   const CORE_DIAMETER_MIN_MM = 12
   const CORE_DIAMETER_MAX_MM = 80
+  const TANK_RESET_THRESHOLD_ML = 1000
 
   let telemetry = []
   let summary = []
@@ -35,10 +39,10 @@
   let lastUpdated = ''
   let selectedModuleId = ''
   let atoMode = 'auto'
-  let motorRunTimeMs = 5000
-  let rollerSpeed = 180
-  let pumpTimeoutMs = 120000
-  let alarmChirpIntervalMs = 120000
+  let motorRunTimeMs = DEFAULT_RUNTIME
+  let rollerSpeed = DEFAULT_ROLLER_SPEED
+  let pumpTimeoutMs = DEFAULT_PUMP_TIMEOUT_MS
+  let alarmChirpIntervalMs = DEFAULT_ALARM_CHIRP_INTERVAL_MS
   let controlMessage = ''
   let controlError = ''
   let controlBusy = false
@@ -48,8 +52,13 @@
   let calibrationModalOpen = false
   let spoolCalibrationAwaitingAck = false
   let controlsVisible = false
+  let purgeConfirming = false
+  let purgeBusy = false
+  let tankRefillConfirming = false
+  let tankRefillBusy = false
   let calibrationAckTimer = null
   let calibrationAckPollInFlight = false
+  let cycleHistoryRefreshTimer = null
   const CONTROL_PUSH_DELAY_MS = 600
   let controlUpdateTimer = null
   let controlUpdatePending = false
@@ -67,7 +76,16 @@
   let activeAlarmModal = null
   let lastAlarmKeys = new Set()
   let acknowledgedAlarmKeys = new Set()
-  let spoolLengthMm = 50000
+  let activeThermistorAlarmDetails = null
+  let atoStats = {
+    count: 0,
+    frequency_per_hour: 0,
+    avg_duration_ms: 0,
+    avg_fill_seconds: 0,
+    total_volume_ml: 0,
+    avg_volume_ml: 0,
+  }
+  let spoolLengthMm = DEFAULT_SPOOL_LENGTH_MM
   let coreDiameterMm = DEFAULT_CORE_DIAMETER_MM
   let mediaThicknessUm = DEFAULT_MEDIA_THICKNESS_UM
   let mediaProfileBusy = false
@@ -78,10 +96,37 @@
   let wsLogError = ''
   let wsLogInterval = null
   let spoolUsageHistory = []
+  let tankUsageHistory = new Map()
+  let heaterTelemetryHistory = new Map()
+  let temperatureSeries = { datasets: [], yMin: undefined, yMax: undefined }
+  let temperatureChartDatasets = []
+  let temperatureYAxisMin = undefined
+  let temperatureYAxisMax = undefined
+  let temperatureChartMeta = null
+  let temperatureSetpointC = 25
+  let heaterSetpointMinC = 24
+  let heaterSetpointMaxC = 26
+  let latestTemperatureSample = null
+  let selectedHeaterSamples = []
+  let heaterSamplesInWindow = []
+  let isHeaterView = false
+  let primaryHeaterSamples = []
+  let primaryHeaterSample = null
+  let heroCurrentTempC = null
+  let heroAverage3dTempC = null
+
   const WS_LOG_REFRESH_MS = 3000
   const HOUR_IN_MS = 60 * 60 * 1000
   const USAGE_HISTORY_WINDOW_MS = 30 * 24 * HOUR_IN_MS
   const USAGE_HISTORY_WINDOW_HOURS = USAGE_HISTORY_WINDOW_MS / HOUR_IN_MS
+  const TANK_USAGE_HISTORY_MS = 30 * 24 * HOUR_IN_MS
+  const HEATER_HISTORY_WINDOW_MS = 72 * HOUR_IN_MS
+  const HEATER_SETPOINT_MIN_BOUND_C = 10
+  const HEATER_SETPOINT_MAX_BOUND_C = 35
+  const HERO_AVERAGE_WINDOW_MS = 72 * HOUR_IN_MS
+  const TANK_RESET_STORAGE_KEY = 'pickle-reef::tank-reset-epoch'
+  const SPOOL_USAGE_STORAGE_KEY = 'pickle-reef::spool-usage-history'
+  const SPOOL_RESET_STORAGE_KEY = 'pickle-reef::spool-reset-epoch'
   const usageWindowPresets = [
     { hours: 1, label: '1h', description: 'Rolling last hour' },
     { hours: 6, label: '6h', description: 'Rolling last 6 hours' },
@@ -97,20 +142,33 @@
     presets.map((preset) => ({ value: preset.hours, label: preset.label, description: preset.description }))
   const usageWindowButtons = toWindowButtons(usageWindowPresets)
   const cycleWindowButtons = toWindowButtons(cycleWindowPresets)
+  const temperatureWindowPresets = [
+    { hours: 1, label: '1h', description: 'Last 60 minutes of heater telemetry' },
+    { hours: 3, label: '3h', description: 'Rolling last 3 hours' },
+    { hours: 6, label: '6h', description: 'Rolling last 6 hours' },
+    { hours: 12, label: '12h', description: 'Rolling last 12 hours' },
+    { hours: 24, label: '1d', description: 'Full day of heater activity' },
+    { hours: 72, label: '3d', description: 'Multi-day heater drift' },
+  ]
+  const temperatureWindowButtons = toWindowButtons(temperatureWindowPresets)
   const MAX_CYCLE_WINDOW_HOURS = usageWindowPresets.at(-1)?.hours ?? 365 * 24
   const defaultUsagePreset = usageWindowPresets.find((preset) => preset.hours === 24) ?? usageWindowPresets[0]
+  const defaultTemperaturePreset = temperatureWindowPresets.find((preset) => preset.hours === 6) ??
+    temperatureWindowPresets[0]
   let usageChartWindowHours = defaultUsagePreset?.hours ?? 24
   let usageChartWindowMs = usageChartWindowHours * HOUR_IN_MS
+  let temperatureChartWindowHours = defaultTemperaturePreset?.hours ?? 6
+  let temperatureChartWindowMs = temperatureChartWindowHours * HOUR_IN_MS
   const SPOOL_RESET_EDGE_THRESHOLD = 10
   const spoolSnapshots = new Map()
-  const SPOOL_USAGE_STORAGE_KEY = 'pickle-reef::spool-usage-history'
-  const SPOOL_RESET_STORAGE_KEY = 'pickle-reef::spool-reset-epoch'
   const spoolResetTimestamps = new Map()
   let spoolResetVersion = 0
+  const tankResetTimestamps = new Map()
+
   const hiddenModuleIds = new Set(['spoolticktester', 'alarmtester'])
   const hiddenModuleIdsLower = new Set([...hiddenModuleIds].map((id) => id.toLowerCase()))
-
-  const DEFAULT_OFFICIAL_MODULE_IDS = ['PickleRoller']
+  const DEFAULT_OFFICIAL_MODULE_IDS = []
+    const PRIMARY_HEATER_MODULE_ID = 'pickleheat'
 
   const parseModuleIdList = (raw) => {
     if (typeof raw !== 'string') return []
@@ -119,6 +177,8 @@
       .map((id) => id.trim())
       .filter(Boolean)
   }
+
+  const normalizeModuleId = (value) => (typeof value === 'string' ? value.trim().toLowerCase() : '')
 
   const resolveOfficialModuleIds = () => {
     const envValue = import.meta.env?.VITE_OFFICIAL_MODULE_IDS
@@ -136,7 +196,6 @@
   }
 
   const officialModuleIdsLower = new Set(resolveOfficialModuleIds().map((id) => id.toLowerCase()))
-
   const shouldDisplayModule = (module) => {
     const id = (module?.module_id ?? module?.moduleId ?? '').toString().trim()
     if (!id) return false
@@ -147,7 +206,6 @@
   }
 
   const filterDisplayableModules = (list = []) => (list ?? []).filter((module) => shouldDisplayModule(module))
-
   const resolveStorage = () => {
     if (typeof window === 'undefined') return null
     try {
@@ -263,6 +321,306 @@
     persistSpoolResetTimestamps()
   }
 
+  const fallbackTelemetry = [
+    {
+      module_id: 'reef-probe-01',
+      metric: 'temperature',
+      value: 25.8,
+      unit: '°C',
+      captured_at: new Date(Date.now() - 1000 * 60 * 2).toISOString(),
+    },
+    {
+      module_id: 'reef-probe-01',
+      metric: 'ph',
+      value: 8.12,
+      unit: 'pH',
+      captured_at: new Date(Date.now() - 1000 * 60 * 3).toISOString(),
+    },
+    {
+      module_id: 'reef-cabinet-ctrl',
+      metric: 'orp',
+      value: 385,
+      unit: 'mV',
+      captured_at: new Date(Date.now() - 1000 * 60 * 4).toISOString(),
+    },
+    {
+      module_id: 'reef-chiller',
+      metric: 'flow_rate',
+      value: 420,
+      unit: 'L/h',
+      captured_at: new Date(Date.now() - 1000 * 60 * 5).toISOString(),
+    },
+  ]
+
+  const fallbackModules = [
+    {
+      module_id: 'reef-probe-01',
+      label: 'Canary Probe',
+      firmware_version: '1.2.0',
+      status: 'online',
+      ip_address: '192.168.10.54',
+      rssi: -48,
+      last_seen: new Date().toISOString(),
+      status_payload: {
+        motor: { state: 'running', speed: 182, run_time_ms: 2400, mode: 'auto' },
+        floats: { main: false, min: false, max: true },
+        ato: { pump_running: false, manual_mode: false, paused: false, timeout_alarm: false, pump_speed: 140 },
+        system: { chirp_enabled: true, uptime_s: 18200, pump_timeout_ms: 120000 },
+        spool: {
+          full_edges: 528000,
+          used_edges: 68000,
+          remaining_edges: 460000,
+          percent_remaining: 87,
+          empty_alarm: false,
+          total_length_mm: 50000,
+          sample_length_mm: 10000,
+          calibrating: false,
+          activations: 128,
+        },
+      },
+      alarms: [
+        {
+          code: 'pump_timeout',
+          severity: 'warning',
+          active: true,
+          message: 'ATO pump exceeded pump_timeout_ms',
+          timestamp_s: 18000,
+          meta: { timeout_ms: 120000, runtime_ms: 135000 },
+          received_at: new Date().toISOString(),
+        },
+      ],
+    },
+    {
+      module_id: 'reef-cabinet-ctrl',
+      label: 'Cabinet Controller',
+      firmware_version: '0.9.5',
+      status: 'discovering',
+      ip_address: '192.168.10.88',
+      rssi: -62,
+      last_seen: new Date(Date.now() - 1000 * 30).toISOString(),
+      status_payload: {
+        motor: { state: 'stopped', speed: 0, run_time_ms: 0, mode: 'manual' },
+        floats: { main: false, min: true, max: false },
+        ato: { pump_running: true, manual_mode: true, paused: false, timeout_alarm: false, pump_speed: 180 },
+        system: { chirp_enabled: false, uptime_s: 2600, pump_timeout_ms: 180000 },
+        spool: {
+          full_edges: 528000,
+          used_edges: 500000,
+          remaining_edges: 28000,
+          percent_remaining: 5,
+          empty_alarm: false,
+          total_length_mm: 50000,
+          sample_length_mm: 10000,
+          calibrating: false,
+          activations: 420,
+        },
+      },
+      alarms: [],
+    },
+  ]
+
+  const fallbackRollerEvents = [
+    { hoursAgo: 2, duration: 3200, type: 'roller_auto', trigger: 'main_float' },
+    { hoursAgo: 6, duration: 1800, type: 'roller_auto', trigger: 'auto_timer' },
+    { hoursAgo: 12, duration: 2400, type: 'roller_manual', trigger: 'manual_button' },
+    { hoursAgo: 20, duration: 2800, type: 'roller_auto', trigger: 'main_float' },
+    { hoursAgo: 30, duration: 2000, type: 'roller_auto', trigger: 'auto_timer' },
+    { hoursAgo: 55, duration: 2600, type: 'roller_auto', trigger: 'main_float' },
+    { hoursAgo: 90, duration: 3100, type: 'roller_auto', trigger: 'main_float' },
+    { hoursAgo: 130, duration: 2300, type: 'roller_manual', trigger: 'manual_button' },
+  ]
+
+  const fallbackPumpEvents = [
+    { hoursAgo: 1.5, duration: 7800, type: 'pump_normal', trigger: 'min_float' },
+    { hoursAgo: 8, duration: 6400, type: 'pump_normal', trigger: 'auto_timer' },
+    { hoursAgo: 16, duration: 7200, type: 'pump_manual', trigger: 'manual_button' },
+    { hoursAgo: 26, duration: 6800, type: 'pump_normal', trigger: 'min_float' },
+    { hoursAgo: 40, duration: 7100, type: 'pump_normal', trigger: 'min_float' },
+    { hoursAgo: 65, duration: 7500, type: 'pump_normal', trigger: 'auto_timer' },
+    { hoursAgo: 110, duration: 7000, type: 'pump_manual', trigger: 'manual_button' },
+  ]
+
+  const summarizeCycles = (records, windowHours) => {
+    const count = records.length
+    const totalDuration = records.reduce((sum, record) => sum + (record.duration_ms ?? 0), 0)
+    const avgDuration = count ? totalDuration / count : 0
+    const frequency = count && windowHours ? count / windowHours : 0
+    return {
+      count,
+      total_duration_ms: totalDuration,
+      avg_duration_ms: avgDuration,
+      frequency_per_hour: frequency,
+    }
+  }
+
+  const buildFallbackCycleHistory = (windowHours = 24) => {
+    const toRecord = (event, index, moduleId) => ({
+      id: index + 1,
+      module_id: moduleId,
+      cycle_type: event.type,
+      trigger: event.trigger,
+      duration_ms: event.duration,
+      timeout: Boolean(event.timeout),
+      recorded_at: new Date(Date.now() - event.hoursAgo * 60 * 60 * 1000).toISOString(),
+    })
+
+    const rollerRuns = fallbackRollerEvents
+      .filter((event) => event.hoursAgo <= windowHours)
+      .map((event, index) => toRecord(event, index, 'reef-roller-demo'))
+    const atoRuns = fallbackPumpEvents
+      .filter((event) => event.hoursAgo <= windowHours)
+      .map((event, index) => toRecord(event, index, 'reef-roller-demo'))
+
+    const rollerStats = summarizeCycles(rollerRuns, windowHours)
+    const atoStats = summarizeCycles(atoRuns, windowHours)
+    atoStats.avg_fill_seconds = atoStats.avg_duration_ms ? atoStats.avg_duration_ms / 1000 : 0
+    return {
+      window_hours: windowHours,
+      roller_runs: rollerRuns,
+      roller_stats: rollerStats,
+      ato_runs: atoRuns,
+      ato_stats: atoStats,
+    }
+  }
+
+  const SUBSYSTEM_TEMPLATES = {
+    roller: { suffix: 'Roller', badge: 'Filter' },
+    ato: { suffix: 'ATO', badge: 'ATO' },
+  }
+
+  const FALLBACK_SUBSYSTEMS = Object.entries(SUBSYSTEM_TEMPLATES).map(([kind, meta]) => ({
+    key: kind,
+    kind,
+    card_suffix: meta.suffix,
+    badge_label: meta.badge,
+  }))
+
+  const normalizeSubsystemKind = (value) => {
+    if (typeof value !== 'string') return ''
+    return value.split(':')[0].toLowerCase()
+  }
+
+  const resolveModuleSubsystems = (module) => {
+    if (Array.isArray(module?.subsystems) && module.subsystems.length) {
+      return module.subsystems
+        .map((entry) => (typeof entry === 'string' ? { key: entry } : entry))
+        .filter((entry) => entry && typeof entry === 'object')
+    }
+    return FALLBACK_SUBSYSTEMS
+  }
+
+  const buildSubsystemMeta = (baseLabel, definition = {}, index = 0) => {
+    const kind = normalizeSubsystemKind(definition.kind ?? definition.key ?? 'roller') || 'roller'
+    const template = SUBSYSTEM_TEMPLATES[kind] ?? {}
+    const cardSuffix = definition.card_suffix ?? definition.suffix ?? template.suffix ?? ''
+    const label = definition.label ?? (cardSuffix ? `${baseLabel} ${cardSuffix}` : baseLabel)
+    const badgeLabel = definition.badge_label ?? definition.badge ?? template.badge ?? (cardSuffix || 'Subsystem')
+    const key = definition.key ?? `${kind}-${index}`
+    return {
+      kind,
+      label,
+      badgeLabel,
+      cardSuffix,
+      key,
+      badgeVariant: definition.badge_variant ?? template.badgeVariant ?? '',
+    }
+  }
+
+  const createSubsystemCards = (module) => {
+    if (!module?.module_id) return []
+    const baseLabel = module.label ?? module.module_id
+    const definitions = resolveModuleSubsystems(module)
+    return definitions.map((definition, index) => {
+      const meta = buildSubsystemMeta(baseLabel, definition, index)
+      const cardId = definition.card_id ?? `${module.module_id}::${meta.key}`
+      return {
+        ...module,
+        label: meta.label,
+        badge_label: meta.badgeLabel,
+        badge_variant: meta.badgeVariant,
+        subsystem: meta.kind,
+        card_id: cardId,
+        module_type: module.module_type ?? module.moduleType ?? null,
+        subsystem_meta: { ...definition, card_suffix: meta.cardSuffix, kind: meta.kind, key: meta.key },
+      }
+    })
+  }
+
+  const getCardModuleId = (card) => card?.module_id ?? card?.moduleId ?? ''
+  const getCardSubsystem = (card) => normalizeSubsystemKind(card?.subsystem ?? card?.subsystem_meta?.kind ?? '')
+  const isRollerSubsystem = (subsystem) => normalizeSubsystemKind(subsystem) === 'roller'
+  const isHeaterSubsystem = (subsystem) => normalizeSubsystemKind(subsystem) === 'heater'
+  const isHeaterCard = (card = {}) => {
+    if (!card) return false
+    if (isHeaterSubsystem(card.subsystem)) return true
+    const moduleType = typeof card.module_type === 'string' ? card.module_type.trim().toLowerCase() : ''
+    return moduleType === 'heater'
+  }
+
+  const guessSubsystemFromAlert = (alert = {}) => {
+    const haystack = `${alert.code ?? ''} ${alert.description ?? ''} ${alert.message ?? ''}`.toLowerCase()
+    if (haystack.includes('ato') || haystack.includes('pump') || haystack.includes('reservoir') || haystack.includes('tank')) {
+      return 'ato'
+    }
+    return 'roller'
+  }
+
+  const focusModuleCard = (moduleId, subsystem) => {
+    if (!moduleId) return
+    const desiredSubsystem = normalizeSubsystemKind(subsystem)
+    const pool = typeof moduleCards === 'undefined' ? [] : moduleCards
+    const match =
+      pool.find((card) => {
+        if (getCardModuleId(card) !== moduleId) return false
+        if (desiredSubsystem && getCardSubsystem(card) !== desiredSubsystem) return false
+        return true
+      }) ?? pool.find((card) => getCardModuleId(card) === moduleId)
+    if (match) {
+      selectedModuleId = match.card_id ?? match.module_id
+    }
+  }
+
+  function hydrateStoredTankResetTimestamps() {
+    const storage = resolveStorage()
+    if (!storage) return new Map()
+    try {
+      const raw = storage.getItem(TANK_RESET_STORAGE_KEY)
+      if (!raw) return new Map()
+      const parsed = JSON.parse(raw)
+      if (!parsed || typeof parsed !== 'object') return new Map()
+      const entries = Object.entries(parsed).filter(([moduleId, timestamp]) => {
+        return typeof moduleId === 'string' && typeof timestamp === 'number' && timestamp > 0
+      })
+      return new Map(entries)
+    } catch (err) {
+      console.warn('Unable to hydrate tank reset timestamps', err)
+      return new Map()
+    }
+  }
+
+  function persistTankResetTimestamps() {
+    const storage = resolveStorage()
+    if (!storage) return
+    try {
+      const cutoff = Date.now() - TANK_USAGE_HISTORY_MS
+      const payload = {}
+      tankResetTimestamps.forEach((timestamp, moduleId) => {
+        if (typeof timestamp === 'number' && timestamp > cutoff) {
+          payload[moduleId] = timestamp
+        }
+      })
+      storage.setItem(TANK_RESET_STORAGE_KEY, JSON.stringify(payload))
+    } catch (err) {
+      console.warn('Unable to persist tank reset timestamps', err)
+    }
+  }
+
+  function markTankReset(moduleId, timestamp = Date.now()) {
+    if (!moduleId) return
+    tankResetTimestamps.set(moduleId, timestamp)
+    persistTankResetTimestamps()
+  }
+
   function handleSpoolReset(moduleId, timestamp = Date.now()) {
     if (!moduleId) return
     const hadHistory = spoolUsageHistory.some((entry) => entry.moduleId === moduleId)
@@ -318,125 +676,218 @@
     })
   }
 
-  const fallbackTelemetry = [
-    {
-      module_id: 'reef-probe-01',
-      metric: 'temperature',
-      value: 25.8,
-      unit: '°C',
-      captured_at: new Date(Date.now() - 1000 * 60 * 2).toISOString(),
-    },
-    {
-      module_id: 'reef-probe-01',
-      metric: 'ph',
-      value: 8.12,
-      unit: 'pH',
-      captured_at: new Date(Date.now() - 1000 * 60 * 3).toISOString(),
-    },
-    {
-      module_id: 'reef-cabinet-ctrl',
-      metric: 'orp',
-      value: 385,
-      unit: 'mV',
-      captured_at: new Date(Date.now() - 1000 * 60 * 4).toISOString(),
-    },
-    {
-      module_id: 'reef-chiller',
-      metric: 'flow_rate',
-      value: 420,
-      unit: 'L/h',
-      captured_at: new Date(Date.now() - 1000 * 60 * 5).toISOString(),
-    },
+  const convertToCelsius = (value, unit = '°C') => {
+    if (typeof value !== 'number' || Number.isNaN(value)) return null
+    const normalized = typeof unit === 'string' ? unit.toLowerCase() : ''
+    if (normalized.includes('f')) {
+      return ((value - 32) * 5) / 9
+    }
+    return value
+  }
+
+  const buildThermometerKey = (label, index) => {
+    if (typeof label === 'string' && label.trim().length) {
+      const cleaned = label.trim().toLowerCase().replace(/[^a-z0-9]+/g, '-')
+      return cleaned || `thermometer-${index + 1}`
+    }
+    return `thermometer-${index + 1}`
+  }
+
+  const extractNormalizedThermometers = (module) => {
+    const readings = getHeaterThermometers(module)
+    if (!readings?.length) return []
+    return readings
+      .map((reading, index) => {
+        const valueC = convertToCelsius(reading.value, reading.unit)
+        if (valueC == null) return null
+        const label = reading.label ?? `Thermometer ${index + 1}`
+        return {
+          key: buildThermometerKey(label, index),
+          label,
+          value: valueC,
+        }
+      })
+      .filter((entry) => entry)
+  }
+
+  const recordHeaterTelemetrySnapshot = (moduleList = []) => {
+    if (!Array.isArray(moduleList) || moduleList.length === 0) return
+    const now = Date.now()
+    const cutoff = now - HEATER_HISTORY_WINDOW_MS
+    const nextHistory = new Map(heaterTelemetryHistory)
+    moduleList.forEach((module) => {
+      const moduleId = module?.module_id
+      if (!moduleId) return
+      const thermometers = extractNormalizedThermometers(module)
+      if (!thermometers.length) return
+      const heaterState = describeHeaterPowerState(module)
+      const sample = {
+        timestamp: now,
+        thermometers,
+        heaterState: heaterState?.active ?? false,
+        heaterDescription: heaterState?.description ?? '',
+      }
+      const samples = nextHistory.get(moduleId) ?? []
+      samples.push(sample)
+      const filtered = samples.filter((entry) => entry.timestamp >= cutoff)
+      nextHistory.set(moduleId, filtered)
+    })
+    heaterTelemetryHistory = nextHistory
+  }
+
+  const THERMOMETER_COLORS = [
+    { border: 'rgba(255, 145, 123, 0.9)', background: 'rgba(255, 145, 123, 0.18)' },
+    { border: 'rgba(125, 196, 255, 0.9)', background: 'rgba(125, 196, 255, 0.2)' },
+    { border: 'rgba(160, 236, 174, 0.9)', background: 'rgba(160, 236, 174, 0.18)' },
   ]
 
-  const fallbackModules = [
-    {
-      module_id: 'reef-probe-01',
-      label: 'Canary Probe',
-      firmware_version: '1.2.0',
-      status: 'online',
-      ip_address: '192.168.10.54',
-      rssi: -48,
-      last_seen: new Date().toISOString(),
-      status_payload: {
-        motor: { state: 'running', speed: 182, run_time_ms: 2400, mode: 'auto' },
-        floats: { main: false, min: false, max: true },
-        ato: { pump_running: false, manual_mode: false, paused: false, timeout_alarm: false, pump_speed: 140 },
-        system: { chirp_enabled: true, uptime_s: 18_200, pump_timeout_ms: 120_000 },
-        spool: {
-          full_edges: 528_000,
-          used_edges: 68_000,
-          remaining_edges: 460_000,
-          percent_remaining: 87,
-          empty_alarm: false,
-          total_length_mm: 50_000,
-          sample_length_mm: 10_000,
-          calibrating: false,
-          activations: 128,
-        },
-      },
-      alarms: [
-        {
-          code: 'pump_timeout',
-          severity: 'warning',
-          active: true,
-          message: 'ATO pump exceeded pump_timeout_ms',
-          timestamp_s: 18_000,
-          meta: { timeout_ms: 120000, runtime_ms: 135000 },
-          received_at: new Date().toISOString(),
-        },
-      ],
-    },
-    {
-      module_id: 'reef-cabinet-ctrl',
-      label: 'Cabinet Controller',
-      firmware_version: '0.9.5',
-      status: 'discovering',
-      ip_address: '192.168.10.88',
-      rssi: -62,
-      last_seen: new Date(Date.now() - 1000 * 30).toISOString(),
-      status_payload: {
-        motor: { state: 'stopped', speed: 0, run_time_ms: 0, mode: 'manual' },
-        floats: { main: false, min: true, max: false },
-        ato: { pump_running: true, manual_mode: true, paused: false, timeout_alarm: false, pump_speed: 180 },
-        system: { chirp_enabled: false, uptime_s: 2600, pump_timeout_ms: 180_000 },
-        spool: {
-          full_edges: 528_000,
-          used_edges: 500_000,
-          remaining_edges: 28_000,
-          percent_remaining: 5,
-          empty_alarm: false,
-          total_length_mm: 50_000,
-          sample_length_mm: 10_000,
-          calibrating: false,
-          activations: 420,
-        },
-      },
-      alarms: [],
-    },
-  ]
+  const buildTemperatureSeries = (samples = [], setpointTarget = null, setpointMin = null, setpointMax = null) => {
+    if (!samples.length) {
+      return { datasets: [], yMin: undefined, yMax: undefined }
+    }
 
-  const fallbackRollerEvents = [
-    { hoursAgo: 2, duration: 3200, type: 'roller_auto', trigger: 'main_float' },
-    { hoursAgo: 6, duration: 1800, type: 'roller_auto', trigger: 'auto_timer' },
-    { hoursAgo: 12, duration: 2400, type: 'roller_manual', trigger: 'manual_button' },
-    { hoursAgo: 20, duration: 2800, type: 'roller_auto', trigger: 'main_float' },
-    { hoursAgo: 30, duration: 2000, type: 'roller_auto', trigger: 'auto_timer' },
-    { hoursAgo: 55, duration: 2600, type: 'roller_auto', trigger: 'main_float' },
-    { hoursAgo: 90, duration: 3100, type: 'roller_auto', trigger: 'main_float' },
-    { hoursAgo: 130, duration: 2300, type: 'roller_manual', trigger: 'manual_button' },
-  ]
+    const seriesMap = new Map()
+    const values = []
+    const toFiniteNumber = (value) => {
+      if (value == null) return null
+      const numeric = typeof value === 'number' ? value : Number(value)
+      return Number.isFinite(numeric) ? numeric : null
+    }
+    const finiteSetpoint = toFiniteNumber(setpointTarget)
+    const finiteSetpointMin = toFiniteNumber(setpointMin)
+    const finiteSetpointMax = toFiniteNumber(setpointMax)
 
-  const fallbackPumpEvents = [
-    { hoursAgo: 1.5, duration: 7800, type: 'pump_normal', trigger: 'min_float' },
-    { hoursAgo: 8, duration: 6400, type: 'pump_normal', trigger: 'auto_timer' },
-    { hoursAgo: 16, duration: 7200, type: 'pump_manual', trigger: 'manual_button' },
-    { hoursAgo: 26, duration: 6800, type: 'pump_normal', trigger: 'min_float' },
-    { hoursAgo: 40, duration: 7100, type: 'pump_normal', trigger: 'min_float' },
-    { hoursAgo: 65, duration: 7500, type: 'pump_normal', trigger: 'auto_timer' },
-    { hoursAgo: 110, duration: 7000, type: 'pump_manual', trigger: 'manual_button' },
-  ]
+    samples.forEach((sample) => {
+      sample.thermometers.forEach((reading, index) => {
+        if (typeof reading.value !== 'number' || Number.isNaN(reading.value)) return
+        values.push(reading.value)
+        const existing = seriesMap.get(reading.key)
+        const bucket =
+          existing ?? {
+            label: reading.label ?? `Thermometer ${index + 1}`,
+            points: [],
+          }
+        bucket.points.push({ x: sample.timestamp, y: reading.value })
+        seriesMap.set(reading.key, bucket)
+      })
+    })
 
+    if (finiteSetpoint != null) {
+      values.push(finiteSetpoint)
+    }
+    if (finiteSetpointMin != null) {
+      values.push(finiteSetpointMin)
+    }
+    if (finiteSetpointMax != null) {
+      values.push(finiteSetpointMax)
+    }
+
+      if (!values.length) {
+        return { datasets: [], yMin: undefined, yMax: undefined }
+      }
+
+      const minValue = Math.min(...values)
+      const maxValue = Math.max(...values)
+      const padding = Math.max(0.5, (maxValue - minValue) * 0.15 || 0.8)
+      const yMin = minValue - padding
+      const yMax = maxValue + padding
+
+      const datasets = Array.from(seriesMap.values()).map((entry, index) => {
+        const palette = THERMOMETER_COLORS[index % THERMOMETER_COLORS.length]
+        return {
+          label: entry.label,
+          data: entry.points,
+          borderColor: palette.border,
+          backgroundColor: palette.background,
+          borderWidth: 2,
+          fill: false,
+          tension: 0.3,
+          pointRadius: 2,
+          pointHoverRadius: 4,
+          spanGaps: true,
+        }
+      })
+
+      const heaterHigh = yMax - padding * 0.2
+      const heaterLow = yMin + padding * 0.2
+      const heaterSeries = samples.map((sample) => ({
+        x: sample.timestamp,
+        y: sample.heaterState ? heaterHigh : heaterLow,
+        heaterOn: sample.heaterState,
+      }))
+      if (heaterSeries.length) {
+        datasets.push({
+          label: 'Heater state',
+          data: heaterSeries,
+          borderColor: 'rgba(246, 195, 67, 0.95)',
+          backgroundColor: 'rgba(246, 195, 67, 0.15)',
+          borderWidth: 2,
+          fill: false,
+          stepped: true,
+          pointRadius: 0,
+          spanGaps: false,
+          tension: 0,
+        })
+      }
+
+      const pushSetpointDataset = (label, value, options = {}) => {
+        if (value == null) return
+        datasets.push({
+          label,
+          data: samples.map((sample) => ({
+            x: sample.timestamp,
+            y: value,
+          })),
+          borderColor: options.borderColor ?? 'rgba(255, 255, 255, 0.65)',
+          borderWidth: options.borderWidth ?? 2,
+          borderDash: options.borderDash ?? [6, 4],
+          fill: options.fill ?? false,
+          pointRadius: 0,
+          pointHoverRadius: 0,
+          tension: 0,
+        })
+      }
+
+      pushSetpointDataset('Setpoint', finiteSetpoint, {
+        borderColor: 'rgba(255, 255, 255, 0.75)',
+        borderDash: [6, 4],
+      })
+      pushSetpointDataset('Setpoint min', finiteSetpointMin, {
+        borderColor: 'rgba(250, 153, 114, 0.85)',
+        borderDash: [4, 6],
+      })
+      pushSetpointDataset('Setpoint max', finiteSetpointMax, {
+        borderColor: 'rgba(119, 215, 255, 0.85)',
+        borderDash: [8, 4],
+      })
+
+      return { datasets, yMin, yMax }
+    }
+
+    const buildTemperatureMeta = (sample, module) => {
+      if (!sample) return null
+      const readings = sample.thermometers?.map((reading) => ({
+        label: reading.label,
+        value: reading.value,
+      }))
+      const heaterState = describeHeaterPowerState(module ?? {})
+      return {
+        timestamp: sample.timestamp,
+        readings: readings ?? [],
+        heaterOn: heaterState?.active ?? sample.heaterState ?? false,
+        description: heaterState?.description ?? sample.heaterDescription ?? '',
+      }
+    }
+
+    const computeSampleAverageC = (sample) => {
+      if (!sample?.thermometers?.length) return null
+      const values = sample.thermometers
+        .map((reading) => (typeof reading.value === 'number' ? reading.value : Number(reading.value)))
+        .filter((value) => Number.isFinite(value))
+      if (!values.length) return null
+      const sum = values.reduce((total, value) => total + value, 0)
+      return sum / values.length
+    }
   const stopWsLogPolling = () => {
     if (wsLogInterval) {
       clearInterval(wsLogInterval)
@@ -482,49 +933,21 @@
     stopWsLogPolling()
   }
 
-  const summarizeCycles = (records, windowHours) => {
-    const count = records.length
-    const totalDuration = records.reduce((sum, record) => sum + (record.duration_ms ?? 0), 0)
-    const avgDuration = count ? totalDuration / count : 0
-    const frequency = count && windowHours ? count / windowHours : 0
-    return {
-      count,
-      total_duration_ms: totalDuration,
-      avg_duration_ms: avgDuration,
-      frequency_per_hour: frequency,
-    }
+  const runtimeMsToMilliliters = (durationMs = 0) => {
+    const numeric = typeof durationMs === 'number' ? durationMs : Number(durationMs)
+    if (!Number.isFinite(numeric) || numeric <= 0) return 0
+    return numeric * FLOW_ML_PER_MS
   }
 
-  const buildFallbackCycleHistory = (windowHours = 24) => {
-    const toRecord = (event, index, moduleId) => ({
-      id: index + 1,
-      module_id: moduleId,
-      cycle_type: event.type,
-      trigger: event.trigger,
-      duration_ms: event.duration,
-      timeout: Boolean(event.timeout),
-      recorded_at: new Date(Date.now() - event.hoursAgo * 60 * 60 * 1000).toISOString(),
-    })
-
-    const rollerRuns = fallbackRollerEvents
-      .filter((event) => event.hoursAgo <= windowHours)
-      .map((event, index) => toRecord(event, index, 'reef-roller-demo'))
-    const atoRuns = fallbackPumpEvents
-      .filter((event) => event.hoursAgo <= windowHours)
-      .map((event, index) => toRecord(event, index, 'reef-roller-demo'))
-
-    const rollerStats = summarizeCycles(rollerRuns, windowHours)
-    const atoStats = summarizeCycles(atoRuns, windowHours)
-    atoStats.avg_fill_seconds = atoStats.avg_duration_ms ? atoStats.avg_duration_ms / 1000 : 0
-
-    return {
-      window_hours: windowHours,
-      roller_runs: rollerRuns,
-      roller_stats: rollerStats,
-      ato_runs: atoRuns,
-      ato_stats: atoStats,
-    }
+  const isAtoResetEvent = (run = {}) => {
+    const type = (run.cycle_type ?? '').toString().toLowerCase()
+    const trigger = (run.trigger ?? '').toString().toLowerCase()
+    return type.includes('reset') || trigger.includes('refill') || trigger.includes('reset')
   }
+
+  
+
+  
 
   const metricCopy = {
     temperature: { label: 'Water Temp', unit: '°C' },
@@ -557,10 +980,10 @@
     }
     return `Rolling last ${hours} hour${hours === 1 ? '' : 's'}`
   }
-  const describeSpoolMetricBaseline = (timestamp) => {
-    if (!timestamp) return 'Clears when spool resets'
+  const formatBaselineTimestamp = (timestamp) => {
+    if (!timestamp) return '—'
     const date = new Date(timestamp)
-    return Number.isNaN(date.getTime()) ? 'Clears when spool resets' : `Since reset ${date.toLocaleString()}`
+    return Number.isNaN(date.getTime()) ? '—' : date.toLocaleString()
   }
   const getUsageWindowStart = () => Math.max(Date.now() - usageChartWindowMs, moduleSpoolBaselineMs || 0)
 
@@ -577,7 +1000,7 @@
     return new Date(timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
   }
 
-  const buildActivationDatasets = (markers, maxValue) => {
+  const buildActivationDatasets = (markers, maxValue, options = {}) => {
     if (!markers?.length || !maxValue) return []
     const data = []
     markers.forEach((marker) => {
@@ -587,11 +1010,11 @@
     })
     return [
       {
-        label: 'Roller activations',
+        label: options.label ?? 'Roller activations',
         data,
-        borderColor: 'rgba(248, 251, 255, 0.4)',
-        borderWidth: 1,
-        borderDash: [4, 4],
+        borderColor: options.borderColor ?? 'rgba(248, 251, 255, 0.4)',
+        borderWidth: options.borderWidth ?? 1,
+        borderDash: options.borderDash ?? [4, 4],
         pointRadius: 0,
         fill: false,
         showLine: true,
@@ -616,29 +1039,66 @@
     const value = typeof raw.y === 'number' ? raw.y : context.parsed?.y
     const timeValue = raw.x ?? context.parsed?.x
     if (value === undefined || timeValue === undefined) return ''
-    return `${formatCycleDuration(value)} • ${formatCycleTimestamp(timeValue)}`
+    return `${formatMilliliters(value)} • ${formatCycleTimestamp(timeValue)}`
   }
 
-  const deriveDurationTargetMax = (runs) => {
-    if (!runs?.length) return 1
-    const maxDuration = Math.max(...runs.map((run) => run.duration_ms || 0), 0)
-    return Math.max(maxDuration * 1.1, 1)
+  const temperatureTooltipFormatter = (context) => {
+    const raw = context.raw ?? {}
+    const datasetLabel = context.dataset?.label ?? 'Temperature'
+    const timeValue = raw.x ?? context.parsed?.x
+    if (datasetLabel === 'Heater state') {
+      const heaterOn = raw.heaterOn ?? (typeof context.parsed?.y === 'number' ? context.parsed.y > 0 : false)
+      if (timeValue === undefined) return ''
+      return `${datasetLabel}: ${heaterOn ? 'On' : 'Off'} • ${formatCycleTimestamp(timeValue)}`
+    }
+    const value = typeof raw.y === 'number' ? raw.y : context.parsed?.y
+    if (value === undefined || timeValue === undefined) return ''
+    return `${datasetLabel}: ${formatCelsiusValue(value)} • ${formatCycleTimestamp(timeValue)}`
   }
 
-  const buildChartPoints = (runs) => {
+  const buildAtoVolumePoints = (runs) => {
     if (!runs?.length) return []
     const sortedRuns = [...runs].sort(
       (a, b) => new Date(a.recorded_at).getTime() - new Date(b.recorded_at).getTime()
     )
+    let cumulative = 0
     return sortedRuns.map((run) => {
       const ts = new Date(run.recorded_at).getTime()
-      const duration = run.duration_ms || 0
+      const duration = Math.max(0, run.duration_ms ?? 0)
+      const volume = runtimeMsToMilliliters(duration)
+      const resetEvent = isAtoResetEvent(run)
+      if (resetEvent) {
+        cumulative = 0
+      }
+      cumulative += volume
       return {
         ts,
         duration,
+        volume,
+        cumulative,
         timestamp: run.recorded_at,
+        reset: resetEvent,
       }
     })
+  }
+
+  const findRecentTankResetTimestamp = (samples = []) => {
+    if (!samples?.length) return null
+    let previous = null
+    for (let idx = samples.length - 1; idx >= 0; idx -= 1) {
+      const sample = samples[idx]
+      if (!sample) continue
+      const used = sample.usedMl
+      if (typeof used !== 'number') continue
+      if (used <= TANK_RESET_THRESHOLD_ML) {
+        return sample.timestamp
+      }
+      if (previous != null && used + TANK_RESET_THRESHOLD_ML < previous) {
+        return sample.timestamp
+      }
+      previous = used
+    }
+    return null
   }
 
   const deriveSummary = (dataset) => {
@@ -671,41 +1131,50 @@
       modules = filteredModules
       detectSpoolResets(filteredModules)
       await loadSpoolUsageHistory(filteredModules)
+      recordTankUsageSnapshot(filteredModules)
+      recordHeaterTelemetrySnapshot(filteredModules)
       error = ''
       controlError = ''
     } catch (err) {
-      console.warn('Falling back to demo data', err)
+      console.error('Unable to load live module data', err)
       if (!telemetry.length) {
-        telemetry = fallbackTelemetry
-        summary = deriveSummary(fallbackTelemetry)
-        const demoModules = filterDisplayableModules(fallbackModules)
-        modules = demoModules
-        const fallbackForTracking = demoModules.map((module) => ({
-          ...module,
-          spool_state: module.status_payload?.spool ?? module.spool ?? {},
-        }))
-        trackSpoolUsage(fallbackForTracking)
+        telemetry = []
       }
-      error = 'Live modules not responding — displaying demo stream.'
+      if (!summary.length) {
+        summary = []
+      }
+      if (!modules.length) {
+        modules = []
+      }
+      error = 'Live modules not responding.'
     } finally {
       loading = false
       lastUpdated = new Date().toLocaleTimeString()
     }
   }
 
-  async function loadCycleHistory(windowHours = cycleWindow) {
-    cycleHistoryLoading = true
-    cycleHistoryError = ''
+  async function loadCycleHistory(windowHours = cycleWindow, options = {}) {
+    const { silent = false } = options
+    if (!silent) {
+      cycleHistoryLoading = true
+      cycleHistoryError = ''
+    }
     try {
       cycleHistory = await fetchCycleHistory(windowHours)
-    } catch (err) {
-      console.warn('Unable to load cycle history', err)
-      if (!cycleHistory) {
-        cycleHistory = buildFallbackCycleHistory(windowHours)
+      if (!silent) {
+        cycleHistoryError = ''
       }
-      cycleHistoryError = 'Unable to load cycle history — showing cached data.'
+    } catch (err) {
+      console.error('Unable to load cycle history', err)
+      if (!silent) {
+        cycleHistoryError = cycleHistory
+          ? 'Unable to refresh cycle history — showing cached data.'
+          : 'Unable to load cycle history.'
+      }
     } finally {
-      cycleHistoryLoading = false
+      if (!silent) {
+        cycleHistoryLoading = false
+      }
     }
   }
 
@@ -724,13 +1193,27 @@
     if (storedResets.size) {
       bumpSpoolResetVersion()
     }
+    const storedTankResets = hydrateStoredTankResetTimestamps()
+    tankResetTimestamps.clear()
+    storedTankResets.forEach((timestamp, moduleId) => {
+      if (typeof timestamp === 'number' && moduleId) {
+        tankResetTimestamps.set(moduleId, timestamp)
+      }
+    })
     refresh()
     loadCycleHistory(cycleWindow)
-    const interval = setInterval(() => {
+    const refreshInterval = setInterval(() => {
       refresh()
     }, 15000)
+    cycleHistoryRefreshTimer = setInterval(() => {
+      loadCycleHistory(cycleWindow, { silent: true })
+    }, 20000)
     return () => {
-      clearInterval(interval)
+      clearInterval(refreshInterval)
+      if (cycleHistoryRefreshTimer) {
+        clearInterval(cycleHistoryRefreshTimer)
+        cycleHistoryRefreshTimer = null
+      }
       stopWsLogPolling()
     }
   })
@@ -742,7 +1225,12 @@
     }
   })
 
+  $: activeThermistorAlarmDetails = isThermistorMismatchAlarm(activeAlarmModal)
+    ? describeThermistorAlarmMeta(activeAlarmModal)
+    : null
+
   $: usageChartWindowMs = usageChartWindowHours * HOUR_IN_MS
+  $: temperatureChartWindowMs = temperatureChartWindowHours * HOUR_IN_MS
   $: latestByMetric = telemetry.reduce((acc, row) => {
     const timestamp = new Date(row.captured_at).getTime()
     const existingTs = acc[row.metric]?.ts ?? 0
@@ -752,12 +1240,14 @@
     return acc
   }, {})
 
-  $: moduleCounts = modules.reduce(
+  $: moduleCounts = (Array.isArray(moduleCards) ? moduleCards : []).reduce(
     (acc, module) => {
-      acc[module.status] = (acc[module.status] ?? 0) + 1
+      const status = module.status ?? 'offline'
+      acc[status] = (acc[status] ?? 0) + 1
+      acc.total += 1
       return acc
     },
-    { online: 0, offline: 0, discovering: 0 }
+    { online: 0, offline: 0, discovering: 0, total: 0 }
   )
 
   const statusPalette = {
@@ -784,9 +1274,20 @@
     const configSpool = configPayload.spool ?? {}
     const statusSpool = statusPayload.spool ?? {}
     const mergedSpool = module?.spool_state ?? { ...configSpool, ...statusSpool }
+    const directHeater = statusPayload.heater
+    const listHeater = Array.isArray(statusPayload.heaters)
+      ? statusPayload.heaters.find((entry) => entry && typeof entry === 'object')
+      : null
+    const resolvedHeater =
+      directHeater && typeof directHeater === 'object'
+        ? directHeater
+        : listHeater && typeof listHeater === 'object'
+          ? listHeater
+          : null
 
     return {
       ...module,
+      module_type: module?.module_type ?? module?.moduleType ?? null,
       statusPayload,
       configPayload,
       motor: { ...configMotor, ...statusMotor },
@@ -794,8 +1295,16 @@
       ato: { ...configAto, ...statusAto },
       system: statusPayload.system ?? {},
       spool: mergedSpool,
+      heater: resolvedHeater,
       alarms: module.alarms ?? [],
     }
+  }
+
+  const moduleTypeClassName = (value) => {
+    if (typeof value !== 'string') return ''
+    const normalized = value.trim().toLowerCase()
+    if (!normalized) return ''
+    return `type-${normalized.replace(/[^a-z0-9]+/g, '-')}`
   }
 
   const coalesceNumber = (...values) => {
@@ -805,6 +1314,76 @@
       }
     }
     return undefined
+  }
+
+  const clampSetpointValue = (value) => {
+    if (typeof value !== 'number' || Number.isNaN(value)) return undefined
+    return Math.min(Math.max(value, HEATER_SETPOINT_MIN_BOUND_C), HEATER_SETPOINT_MAX_BOUND_C)
+  }
+
+  const computeTankUsageSinceRefill = (module) => {
+    if (!module) return null
+    const statusPayload = module.statusPayload ?? module.status_payload ?? {}
+    const configPayload = module.configPayload ?? module.config_payload ?? {}
+    const statusAto = statusPayload.ato ?? {}
+    const configAto = configPayload.ato ?? {}
+    const mergedAto = { ...configAto, ...statusAto, ...(module.ato ?? {}) }
+    const capacity = coalesceNumber(
+      mergedAto?.tank_capacity_ml,
+      configAto?.tank_capacity_ml,
+      DEFAULT_TANK_CAPACITY_ML
+    )
+    const level = coalesceNumber(mergedAto?.tank_level_ml)
+    if (capacity == null || level == null) return null
+    return Math.max(0, capacity - level)
+  }
+
+  const recordTankUsageSnapshot = (moduleList = []) => {
+    if (!Array.isArray(moduleList) || moduleList.length === 0) return
+    const now = Date.now()
+    const cutoff = now - TANK_USAGE_HISTORY_MS
+    const nextHistory = new Map(tankUsageHistory)
+    moduleList.forEach((module) => {
+      const moduleId = module?.module_id
+      if (!moduleId) return
+      const snapshot = {
+        module_id: moduleId,
+        ato: {
+          ...(module?.config_payload?.ato ?? {}),
+          ...(module?.configPayload?.ato ?? {}),
+          ...(module?.status_payload?.ato ?? {}),
+          ...(module?.statusPayload?.ato ?? {}),
+          ...(module?.ato ?? {}),
+        },
+        configPayload: {
+          ato: module?.config_payload?.ato ?? module?.configPayload?.ato ?? {},
+        },
+        statusPayload: {
+          ato: module?.status_payload?.ato ?? module?.statusPayload?.ato ?? {},
+        },
+      }
+      const usedMl = computeTankUsageSinceRefill(snapshot)
+      if (usedMl == null) return
+      const samples = nextHistory.get(moduleId) ?? []
+      const previousSample = samples.length ? samples[samples.length - 1] : null
+      const resetDetected =
+        previousSample &&
+        typeof previousSample.usedMl === 'number' &&
+        previousSample.usedMl - usedMl > TANK_RESET_THRESHOLD_ML
+      samples.push({ timestamp: now, usedMl })
+      const filtered = samples.filter((sample) => sample.timestamp >= cutoff)
+      nextHistory.set(moduleId, filtered)
+
+      if (resetDetected || (!previousSample && usedMl <= TANK_RESET_THRESHOLD_ML)) {
+        markTankReset(moduleId, now)
+      } else if (!tankResetTimestamps.has(moduleId)) {
+        const inferred = filtered.find((sample) => sample.usedMl <= TANK_RESET_THRESHOLD_ML)
+        if (inferred) {
+          markTankReset(moduleId, inferred.timestamp)
+        }
+      }
+    })
+    tankUsageHistory = nextHistory
   }
 
   function trackSpoolUsage(moduleList = []) {
@@ -903,6 +1482,307 @@
     if (ato.manual_mode) return 'Manual ready'
     return ato.pump_running ? 'Pump active' : 'Pump idle'
   }
+
+  const describeAtoMode = (ato = {}) => {
+    if (ato.paused) return 'Paused'
+    if (ato.manual_mode) return 'Manual'
+    return 'Auto'
+  }
+
+  const getHeaterPayload = (module = {}) => {
+    const direct = module?.heater
+    if (direct && typeof direct === 'object') {
+      return direct
+    }
+    const statusPayload = module?.statusPayload ?? module?.status_payload ?? {}
+    if (statusPayload?.heater && typeof statusPayload.heater === 'object') {
+      return statusPayload.heater
+    }
+    if (Array.isArray(statusPayload?.heaters)) {
+      const first = statusPayload.heaters.find((entry) => entry && typeof entry === 'object')
+      if (first) {
+        return first
+      }
+    }
+    return null
+  }
+
+  const titleCase = (value) => {
+    if (typeof value !== 'string' || !value.trim().length) return ''
+    return value
+      .trim()
+      .replace(/[_-]+/g, ' ')
+      .split(' ')
+      .map((token) => (token ? token[0].toUpperCase() + token.slice(1) : ''))
+      .join(' ')
+      .trim()
+  }
+
+  const resolveTemperatureReading = (raw, options = {}) => {
+    const { fallbackLabel = 'Thermometer', fallbackUnit = '°C' } = options
+    if (raw == null) return null
+    const coerceNumber = (value) => (typeof value === 'number' && Number.isFinite(value) ? value : null)
+    const fromPrimitive = coerceNumber(raw)
+    if (fromPrimitive != null) {
+      return { label: fallbackLabel, value: fromPrimitive, unit: fallbackUnit }
+    }
+    if (typeof raw !== 'object') return null
+    const label = typeof raw.label === 'string' && raw.label.trim().length ? raw.label.trim() : fallbackLabel
+    const normalizedUnit = (() => {
+      const rawUnit = typeof raw.unit === 'string' ? raw.unit.trim().toLowerCase() : ''
+      if (rawUnit.includes('f')) return '°F'
+      if (rawUnit.includes('c')) return '°C'
+      return fallbackUnit
+    })()
+    const candidateBuckets = [
+      { unit: '°C', keys: ['celsius', 'c', 'deg_c', 'temperature_c', 'value_c', 'temp_c'] },
+      { unit: '°F', keys: ['fahrenheit', 'f', 'deg_f', 'temperature_f', 'value_f', 'temp_f'] },
+      { unit: normalizedUnit, keys: ['value', 'reading', 'temperature'] },
+    ]
+    for (const bucket of candidateBuckets) {
+      for (const key of bucket.keys) {
+        const numeric = coerceNumber(raw[key])
+        if (numeric != null) {
+          return { label, value: numeric, unit: bucket.unit ?? normalizedUnit }
+        }
+      }
+    }
+    const fallbackNumeric = coerceNumber(raw.v)
+    if (fallbackNumeric != null) {
+      return { label, value: fallbackNumeric, unit: normalizedUnit }
+    }
+    return null
+  }
+
+  const buildThermometerKeyVariants = (index) => {
+    const suffixes = ['', '_c', '_f']
+    const bases = ['thermometer', 'thermo', 'probe', 'temp', 'sensor']
+    const separators = ['_', '']
+    const variants = []
+    bases.forEach((base) => {
+      separators.forEach((separator) => {
+        suffixes.forEach((suffix) => {
+          variants.push(`${base}${separator}${index}${suffix}`.toLowerCase())
+        })
+      })
+    })
+    return variants
+  }
+
+  const extractThermometerFromKeys = (payload, index, fallbackLabel) => {
+    if (!payload || typeof payload !== 'object') return null
+    const entries = Object.entries(payload)
+    const variants = buildThermometerKeyVariants(index)
+    for (const key of variants) {
+      const match = entries.find(([entryKey]) => entryKey && entryKey.toLowerCase() === key)
+      if (!match) continue
+      const [, value] = match
+      const fallbackUnit = key.includes('_f') ? '°F' : '°C'
+      const reading = resolveTemperatureReading(value, { fallbackLabel, fallbackUnit })
+      if (reading) {
+        return reading
+      }
+    }
+    return null
+  }
+
+  const getHeaterThermometers = (module = {}) => {
+    const payload = getHeaterPayload(module)
+    if (!payload || typeof payload !== 'object') return []
+    const readings = []
+    const pushReading = (reading) => {
+      if (!reading) return
+      if (readings.some((entry) => entry.label === reading.label)) return
+      readings.push(reading)
+    }
+
+    if (Array.isArray(payload.thermometers)) {
+      payload.thermometers.forEach((entry, idx) => {
+        if (readings.length >= 2) return
+        const label = entry?.label ?? `Thermometer ${idx + 1}`
+        pushReading(resolveTemperatureReading(entry, { fallbackLabel: label }))
+      })
+    } else if (payload.thermometers && typeof payload.thermometers === 'object') {
+      Object.entries(payload.thermometers).forEach(([key, value], idx) => {
+        if (readings.length >= 2) return
+        const label = key ? titleCase(key) : `Thermometer ${idx + 1}`
+        pushReading(resolveTemperatureReading(value, { fallbackLabel: label }))
+      })
+    }
+
+    const pushThermistorArray = (entries, { labelPrefix = 'Thermistor', unit = '°C' } = {}) => {
+      if (!Array.isArray(entries) || !entries.length) return
+      entries.forEach((value, idx) => {
+        if (readings.length >= 2) return
+        pushReading(
+          resolveTemperatureReading(value, {
+            fallbackLabel: `${labelPrefix} ${idx + 1}`,
+            fallbackUnit: unit,
+          })
+        )
+      })
+    }
+
+    if (readings.length < 2) {
+      pushThermistorArray(payload.thermistors_c, { labelPrefix: 'Thermistor', unit: '°C' })
+    }
+    if (readings.length < 2) {
+      pushThermistorArray(payload.thermistors_f, { labelPrefix: 'Thermistor', unit: '°F' })
+    }
+    if (readings.length < 2) {
+      pushThermistorArray(payload.thermistors, { labelPrefix: 'Thermistor' })
+    }
+
+    const primaryKeys = [
+      'primary_temp_c',
+      'primary_temp_f',
+      'primary_temp',
+      'primary',
+      'primary_c',
+      'primary_f',
+    ]
+    const secondaryKeys = [
+      'secondary_temp_c',
+      'secondary_temp_f',
+      'secondary_temp',
+      'secondary',
+      'secondary_c',
+      'secondary_f',
+    ]
+
+    const pushFromKeys = (keys, fallbackLabel) => {
+      if (readings.length >= 2) return
+      for (const key of keys) {
+        if (!(key in payload)) continue
+        const reading = resolveTemperatureReading(payload[key], { fallbackLabel })
+        if (reading) {
+          pushReading(reading)
+          break
+        }
+      }
+    }
+
+    if (readings.length < 2) {
+      pushFromKeys(primaryKeys, 'Primary probe')
+    }
+    if (readings.length < 2) {
+      pushFromKeys(secondaryKeys, 'Secondary probe')
+    }
+
+    if (readings.length < 2) {
+      pushReading(extractThermometerFromKeys(payload, 1, 'Thermometer 1'))
+    }
+    if (readings.length < 2) {
+      pushReading(extractThermometerFromKeys(payload, 2, 'Thermometer 2'))
+    }
+
+    return readings.slice(0, 2)
+  }
+
+  const formatThermometerReading = (reading) => {
+    if (!reading || typeof reading.value !== 'number' || Number.isNaN(reading.value)) return '—'
+    const decimals = Math.abs(reading.value) >= 10 ? 1 : 2
+    return `${reading.value.toFixed(decimals)} ${reading.unit ?? '°C'}`
+  }
+
+  const formatCelsiusValue = (value, fallback = '—') => {
+    if (typeof value !== 'number' || Number.isNaN(value)) return fallback
+    return `${value.toFixed(1)} °C`
+  }
+
+  const isThermistorMismatchAlarm = (alarm) => alarm?.code === 'thermistor_mismatch'
+
+  const describeThermistorAlarmMeta = (alarm = {}) => {
+    if (!alarm) return null
+    const meta = alarm.meta ?? {}
+    const delta = coalesceNumber(meta.delta_c, meta.delta, meta.deltaC)
+    const threshold = coalesceNumber(meta.threshold_c, meta.delta_threshold_c, meta.threshold)
+    const primary = coalesceNumber(meta.primary_temp_c, meta.primary_c, meta.primary)
+    const secondary = coalesceNumber(meta.secondary_temp_c, meta.secondary_c, meta.secondary)
+    if ([delta, threshold, primary, secondary].every((value) => value == null)) {
+      return null
+    }
+    return { delta, threshold, primary, secondary }
+  }
+
+  const getHeaterDutyCyclePercent = (module = {}) => {
+    const payload = getHeaterPayload(module)
+    if (!payload || typeof payload !== 'object') return null
+    const candidates = [
+      payload.duty_per_min,
+      payload.duty_cycle_per_min,
+      payload.duty_cycle_per_minute,
+      payload.duty_cycle_per_min_avg,
+      payload.duty_cycle,
+      payload.output_per_min,
+      payload.output,
+    ]
+    for (const candidate of candidates) {
+      if (typeof candidate === 'number' && Number.isFinite(candidate)) {
+        const percent = candidate > 1 ? candidate : candidate * 100
+        if (Number.isFinite(percent)) {
+          return Math.max(0, Math.min(100, percent))
+        }
+      }
+    }
+    return null
+  }
+
+  const formatDutyCycleLabel = (value) => {
+    if (typeof value !== 'number' || Number.isNaN(value)) return '—'
+    const clamped = Math.max(0, Math.min(100, value))
+    const decimals = clamped >= 10 ? 0 : 1
+    return `${clamped.toFixed(decimals)}%`
+  }
+
+  const describeHeaterPowerState = (module = {}) => {
+    const payload = getHeaterPayload(module) ?? {}
+    const rawState = (payload.state ?? payload.status ?? '').toString().trim()
+    if (rawState) {
+      const normalized = rawState.toLowerCase()
+      const active = normalized.includes('heat') || normalized.includes('on') || normalized.includes('active')
+      const inactive = normalized.includes('idle') || normalized.includes('off') || normalized.includes('standby')
+      return {
+        label: active ? 'On' : inactive ? 'Off' : formatState(rawState),
+        description: formatState(rawState) || 'Heater state',
+        active,
+      }
+    }
+    const dutyPercent = getHeaterDutyCyclePercent(module)
+    if (typeof dutyPercent === 'number') {
+      const active = dutyPercent >= 1
+      return {
+        label: active ? 'On' : 'Off',
+        description: `${formatDutyCycleLabel(dutyPercent)} duty`,
+        active,
+      }
+    }
+    return {
+      label: '—',
+      description: 'Waiting for heater telemetry',
+      active: false,
+    }
+  }
+
+  const buildHeaterSummary = (module = {}) => ({
+    thermometers: getHeaterThermometers(module),
+    heaterState: describeHeaterPowerState(module),
+    dutyPercent: getHeaterDutyCyclePercent(module),
+  })
+
+  const deriveModulePumpTimeout = (module = {}) =>
+    coalesceNumber(
+      module.system?.pump_timeout_ms,
+      module.configPayload?.system?.pump_timeout_ms,
+      module.statusPayload?.system?.pump_timeout_ms
+    ) ?? DEFAULT_PUMP_TIMEOUT_MS
+
+  const deriveModuleChirpInterval = (module = {}) =>
+    coalesceNumber(
+      module.system?.alarm_chirp_interval_ms,
+      module.configPayload?.system?.alarm_chirp_interval_ms,
+      module.statusPayload?.system?.alarm_chirp_interval_ms
+    ) ?? DEFAULT_ALARM_CHIRP_INTERVAL_MS
 
   const severityCopy = {
     critical: { label: 'Critical', badge: 'badge-danger' },
@@ -1009,6 +1889,50 @@
   const formatMicrons = (value) => {
     if (typeof value !== 'number' || Number.isNaN(value)) return '—'
     return `${Math.round(value)} um`
+  }
+
+  const formatMilliliters = (value) => {
+    if (typeof value !== 'number' || Number.isNaN(value)) return '—'
+    if (value >= 1000) {
+      const liters = value / 1000
+      const decimals = liters >= 10 || Number.isInteger(liters) ? 0 : 1
+      return `${liters.toFixed(decimals)} L`
+    }
+    return `${Math.round(value)} ml`
+  }
+
+  const computeTankPercent = (ato = {}) => {
+    if (!ato || typeof ato !== 'object') return undefined
+    if (typeof ato.tank_percent === 'number') {
+      return Math.max(0, Math.min(100, Math.round(ato.tank_percent)))
+    }
+    if (typeof ato.tank_level_ml === 'number' && typeof ato.tank_capacity_ml === 'number' && ato.tank_capacity_ml > 0) {
+      return Math.max(0, Math.min(100, Math.round((ato.tank_level_ml / ato.tank_capacity_ml) * 100)))
+    }
+    return undefined
+  }
+
+  const formatTankPercent = (ato = {}) => {
+    const percent = computeTankPercent(ato)
+    return percent == null ? '—' : `${percent}%`
+  }
+
+  const describeTankVolume = (ato = {}) => {
+    const level = coalesceNumber(ato?.tank_level_ml)
+    const capacity = coalesceNumber(ato?.tank_capacity_ml)
+    if (level != null && capacity != null) {
+      return `${formatMilliliters(level)} / ${formatMilliliters(capacity)}`
+    }
+    if (capacity != null) {
+      return `Capacity ${formatMilliliters(capacity)}`
+    }
+    return 'Awaiting tank telemetry'
+  }
+
+  const tankMeterWidth = (ato = {}) => computeTankPercent(ato) ?? 0
+  const isTankLow = (ato = {}) => {
+    const percent = computeTankPercent(ato)
+    return typeof percent === 'number' && percent <= 25
   }
 
   const formatMmPerEdge = (millimeters) => {
@@ -1214,7 +2138,7 @@
 
   function focusAlarmModule() {
     if (!activeAlarmModal) return
-    selectedModuleId = activeAlarmModal.moduleId
+    focusModuleCard(activeAlarmModal.moduleId, guessSubsystemFromAlert(activeAlarmModal))
   }
 
   const formatDuration = (seconds) => {
@@ -1227,12 +2151,25 @@
     return `${mins}m` + (seconds % 60 ? ` ${seconds % 60}s` : '')
   }
 
+  const getMetricAverage = (metric) => {
+    const match = summary.find((item) => item.metric === metric)
+    if (!match) return null
+    const value = typeof match.avg_value === 'number' ? match.avg_value : Number(match.avg_value)
+    return Number.isFinite(value) ? value : null
+  }
+
   const formatValue = (metric) => {
+    const { unit = '' } = metricCopy[metric] ?? {}
+    if (metric === 'temperature') {
+      const current = heroCurrentTempC ?? getMetricAverage(metric)
+      if (current != null) {
+        return `${current.toFixed(2)} ${unit}`.trim()
+      }
+    }
     const latest = latestByMetric[metric]
-    if (!latest) {
+    if (!latest || typeof latest.value !== 'number') {
       return '—'
     }
-    const { unit } = metricCopy[metric]
     return `${latest.value.toFixed(2)} ${unit}`.trim()
   }
 
@@ -1241,6 +2178,8 @@
   const prefillControls = (module) => {
     if (!module) return
     controlsPrefilledFor = module.module_id
+    heaterSetpointMinC = undefined
+    heaterSetpointMaxC = undefined
     atoMode = deriveAtoMode(module)
     const configMotor = module.configPayload?.motor ?? {}
     const statusMotor = module.statusPayload?.motor ?? {}
@@ -1290,25 +2229,77 @@
         module.configPayload?.spool?.core_diameter_mm,
         module.spool?.core_diameter_mm
       ) ?? DEFAULT_CORE_DIAMETER_MM
-  }
 
-  $: moduleCards = modules.map(hydrateModule)
-  $: if (
-    selectedModuleId &&
-    !moduleCards.some((module) => module.module_id === selectedModuleId)
-  ) {
-    selectedModuleId = moduleCards[0]?.module_id ?? ''
-  }
-  $: if (!selectedModuleId && moduleCards.length) {
-    selectedModuleId = moduleCards[0].module_id
-  }
-  $: if (selectedModuleId && selectedModuleId !== controlsPrefilledFor) {
-    const target = moduleCards.find((module) => module.module_id === selectedModuleId)
-    if (target) {
-      prefillControls(target)
+    const configHeater = module.configPayload?.heater ?? {}
+    const statusHeater = module.statusPayload?.heater ?? {}
+    const mergedHeater = { ...configHeater, ...statusHeater, ...(module.heater ?? {}) }
+
+    const resolvedSetpoint = coalesceNumber(
+      mergedHeater.setpoint_c,
+      mergedHeater.target_c,
+      mergedHeater.average_temp_c
+    )
+    if (resolvedSetpoint != null) {
+      temperatureSetpointC = Number(resolvedSetpoint.toFixed(1))
+    }
+
+    const resolvedMin = coalesceNumber(
+      mergedHeater.setpoint_min_c,
+      mergedHeater.setpoint_low_c,
+      mergedHeater.minimum_c,
+      configHeater.setpoint_min_c
+    )
+    if (resolvedMin != null) {
+      heaterSetpointMinC = clampSetpointValue(resolvedMin)
+    }
+
+    const resolvedMax = coalesceNumber(
+      mergedHeater.setpoint_max_c,
+      mergedHeater.setpoint_high_c,
+      mergedHeater.maximum_c,
+      configHeater.setpoint_max_c
+    )
+    if (resolvedMax != null) {
+      heaterSetpointMaxC = clampSetpointValue(resolvedMax)
+    }
+
+    if (
+      heaterSetpointMinC != null &&
+      heaterSetpointMaxC != null &&
+      heaterSetpointMinC > heaterSetpointMaxC
+    ) {
+      heaterSetpointMaxC = heaterSetpointMinC
     }
   }
-  $: selectedModule = moduleCards.find((module) => module.module_id === selectedModuleId)
+
+  $: hydratedModules = modules.map(hydrateModule)
+  $: moduleCards = hydratedModules
+    .flatMap(createSubsystemCards)
+    .map((card) => (isHeaterCard(card) ? { ...card, heater_summary: buildHeaterSummary(card) } : card))
+  $: if (
+    selectedModuleId &&
+    !moduleCards.some((module) => (module.card_id ?? module.module_id) === selectedModuleId)
+  ) {
+    selectedModuleId = moduleCards[0]?.card_id ?? moduleCards[0]?.module_id ?? ''
+  }
+  $: if (!selectedModuleId && moduleCards.length) {
+    selectedModuleId = moduleCards[0].card_id ?? moduleCards[0].module_id
+  }
+  $: selectedCard = moduleCards.find((module) => (module.card_id ?? module.module_id) === selectedModuleId)
+  $: selectedModule = (() => {
+    if (!selectedCard) return undefined
+    const moduleId = getCardModuleId(selectedCard)
+    return hydratedModules.find((module) => module.module_id === moduleId)
+  })()
+  $: atoWaterUsedSinceRefillMl = computeTankUsageSinceRefill(selectedModule)
+  $: selectedPhysicalModuleId = selectedModule?.module_id ?? ''
+  $: selectedSubsystem = getCardSubsystem(selectedCard) || 'roller'
+  $: isRollerView = isRollerSubsystem(selectedSubsystem)
+  $: isAtoView = normalizeSubsystemKind(selectedSubsystem) === 'ato'
+  $: isHeaterView = isHeaterSubsystem(selectedSubsystem)
+  $: if (selectedPhysicalModuleId && selectedPhysicalModuleId !== controlsPrefilledFor && selectedModule) {
+    prefillControls(selectedModule)
+  }
   $: spoolState = selectedModule?.spool ?? {}
   $: spoolCalibrating = Boolean(spoolState?.calibrating)
   $: spoolSampleLengthMm = spoolState?.sample_length_mm ?? SPOOL_SAMPLE_MM
@@ -1337,17 +2328,17 @@
   $: if (spoolCalibrating && spoolCalibrationAwaitingAck) {
     spoolCalibrationAwaitingAck = false
   }
-  $: if (!selectedModuleId || (selectedModuleId !== controlsPrefilledFor && spoolCalibrationAwaitingAck)) {
+  $: if (!selectedPhysicalModuleId || (selectedPhysicalModuleId !== controlsPrefilledFor && spoolCalibrationAwaitingAck)) {
     spoolCalibrationAwaitingAck = false
   }
   $: if (!spoolCalibrationAwaitingAck) {
     stopCalibrationAckPolling()
   }
-  $: selectedModuleUsage = spoolUsageHistory.filter((entry) => entry.moduleId === selectedModuleId)
+  $: selectedModuleUsage = spoolUsageHistory.filter((entry) => entry.moduleId === selectedPhysicalModuleId)
   $: moduleSpoolBaselineMs = (() => {
     void spoolResetVersion
-    if (!selectedModuleId) return 0
-    return getModuleResetBaseline(selectedModuleId)
+    if (!selectedPhysicalModuleId) return 0
+    return getModuleResetBaseline(selectedPhysicalModuleId)
   })()
   $: usageEntriesSinceBaseline = (() => {
     const baseline = moduleSpoolBaselineMs || 0
@@ -1367,7 +2358,30 @@
     typeof spoolLifetimeActivationCount === 'number' && spoolLifetimeActivationCount > 0
       ? spoolLifetimeUsageMm / spoolLifetimeActivationCount
       : null
-  $: spoolMetricSubcopy = describeSpoolMetricBaseline(moduleSpoolBaselineMs)
+  $: spoolBaselineTimestamp = moduleSpoolBaselineMs || null
+  $: rawAtoActivationCount = coalesceNumber(
+    selectedModule?.ato?.activations,
+    selectedModule?.ato?.activation_count,
+    selectedModule?.ato?.activationCount,
+    selectedModule?.statusPayload?.ato?.activations,
+    selectedModule?.status_payload?.ato?.activations
+  )
+  $: atoLifetimeActivationCount =
+    typeof rawAtoActivationCount === 'number' && Number.isFinite(rawAtoActivationCount)
+      ? Math.max(0, Math.round(rawAtoActivationCount))
+      : null
+  $: atoAverageSinceRefillMl =
+    atoWaterUsedSinceRefillMl != null &&
+    typeof atoLifetimeActivationCount === 'number' &&
+    atoLifetimeActivationCount > 0
+      ? atoWaterUsedSinceRefillMl / atoLifetimeActivationCount
+      : null
+  $: tankLastRefillTimestamp = (() => {
+    if (!selectedPhysicalModuleId) return null
+    const stored = tankResetTimestamps.get(selectedPhysicalModuleId)
+    if (typeof stored === 'number') return stored
+    return findRecentTankResetTimestamp(selectedTankUsageSamples)
+  })()
   $: usageChart = (() => {
     const now = Date.now()
     const baseline = moduleSpoolBaselineMs || 0
@@ -1394,12 +2408,12 @@
     }
   })()
   $: usageActivationMarkers = (() => {
-    if (!selectedModuleId) return []
+    if (!selectedPhysicalModuleId) return []
     const now = Date.now()
     const baseline = moduleSpoolBaselineMs || 0
     const cutoff = Math.max(now - usageChartWindowMs, baseline)
     return (rollerRuns ?? [])
-      .filter((run) => run.module_id === selectedModuleId)
+      .filter((run) => run.module_id === selectedPhysicalModuleId)
       .map((run) => ({
         timestamp: run.recorded_at,
         ts: new Date(run.recorded_at).getTime(),
@@ -1427,22 +2441,77 @@
     : []
   $: rollerRuns = cycleHistory?.roller_runs ?? []
   $: atoRuns = cycleHistory?.ato_runs ?? []
-  $: atoStats = cycleHistory?.ato_stats ?? {
-    count: 0,
-    frequency_per_hour: 0,
-    avg_duration_ms: 0,
-    avg_fill_seconds: 0,
-  }
   $: activeCycleWindowHours = cycleHistory?.window_hours ?? cycleWindow
-  $: atoChartPoints = buildChartPoints(atoRuns)
-  $: atoDurationScaleMax = deriveDurationTargetMax(atoRuns)
-  $: atoYAxisMax = atoDurationScaleMax || undefined
+  $: selectedAtoRuns = selectedPhysicalModuleId
+    ? atoRuns.filter((run) => run.module_id === selectedPhysicalModuleId)
+    : atoRuns
+  $: {
+    const effectiveRuns = selectedAtoRuns.length ? selectedAtoRuns : atoRuns
+    const derivedCount = effectiveRuns.length
+    const totalDuration = effectiveRuns.reduce((sum, run) => sum + (run.duration_ms ?? 0), 0)
+    const avgDurationMs = derivedCount ? totalDuration / derivedCount : 0
+    const avgFillSeconds = avgDurationMs ? avgDurationMs / 1000 : 0
+    const windowVolumeMl = effectiveRuns.reduce((sum, run) => sum + runtimeMsToMilliliters(run.duration_ms ?? 0), 0)
+    const frequencyPerHour = activeCycleWindowHours ? derivedCount / activeCycleWindowHours : 0
+    atoStats = {
+      count: derivedCount,
+      frequency_per_hour: frequencyPerHour,
+      avg_duration_ms: avgDurationMs,
+      avg_fill_seconds: avgFillSeconds,
+      total_volume_ml: windowVolumeMl,
+      avg_volume_ml: derivedCount ? windowVolumeMl / derivedCount : 0,
+    }
+  }
+  $: tankUsageCutoff = Date.now() - activeCycleWindowHours * HOUR_IN_MS
+  $: selectedTankUsageSamples = (() => {
+    if (!selectedPhysicalModuleId) return []
+    return tankUsageHistory.get(selectedPhysicalModuleId) ?? []
+  })()
+  $: atoChartPoints = (() => {
+    if (!selectedTankUsageSamples.length) return []
+    let lastValue = null
+    return [...selectedTankUsageSamples]
+      .filter((sample) => sample.timestamp >= tankUsageCutoff)
+      .sort((a, b) => a.timestamp - b.timestamp)
+      .map((sample) => {
+        const resetDetected = lastValue != null && sample.usedMl + TANK_RESET_THRESHOLD_ML < lastValue
+        lastValue = sample.usedMl
+        return {
+          ts: sample.timestamp,
+          used: sample.usedMl,
+          reset: resetDetected,
+        }
+      })
+  })()
+  $: atoChartMaxValue = (() => {
+    if (!atoChartPoints.length) return 0
+    const maxUsed = Math.max(...atoChartPoints.map((point) => point.used), 0)
+    const estimatedCapacity =
+      coalesceNumber(
+        selectedModule?.ato?.tank_capacity_ml,
+        selectedModule?.configPayload?.ato?.tank_capacity_ml,
+        selectedModule?.config_payload?.ato?.tank_capacity_ml,
+        DEFAULT_TANK_CAPACITY_ML
+      ) ?? DEFAULT_TANK_CAPACITY_ML
+    return Math.max(maxUsed, estimatedCapacity)
+  })()
+  $: atoYAxisMax = atoChartMaxValue ? atoChartMaxValue * 1.05 : undefined
+  $: atoResetMarkers = atoChartPoints.filter((point) => point.reset)
+  $: atoActivationMarkers = (() => {
+    if (!selectedPhysicalModuleId) return []
+    return selectedAtoRuns
+      .map((run) => ({ ts: new Date(run.recorded_at).getTime() }))
+      .filter((marker) => marker.ts >= tankUsageCutoff)
+  })()
   $: atoChartDatasets = atoChartPoints.length
     ? [
         {
-          label: 'ATO runtime',
-          data: atoChartPoints.map((point) => ({ x: point.ts, y: point.duration })),
-          borderColor: 'rgba(95, 179, 255, 0.8)',
+          label: 'Water used',
+          data: atoChartPoints.map((point) => ({
+            x: point.ts,
+            y: point.used,
+          })),
+          borderColor: 'rgba(95, 179, 255, 0.85)',
           backgroundColor: 'rgba(95, 179, 255, 0.15)',
           borderWidth: 2,
           fill: false,
@@ -1452,9 +2521,67 @@
           pointBackgroundColor: '#5fb3ff',
           pointBorderColor: '#020710',
         },
+        ...buildActivationDatasets(atoActivationMarkers, atoChartMaxValue || 0, {
+          label: 'ATO activations',
+          borderColor: 'rgba(248, 251, 255, 0.35)',
+          borderDash: [3, 6],
+        }),
+        ...buildActivationDatasets(
+          atoResetMarkers.map((point) => ({ ts: point.ts })),
+          atoChartMaxValue || 0,
+          {
+            label: 'Tank refills',
+            borderColor: 'rgba(246, 195, 67, 0.8)',
+            borderDash: [2, 6],
+          }
+        ),
       ]
     : []
-  $: alertEntries = moduleCards.flatMap(buildModuleAlerts)
+  $: selectedHeaterSamples = selectedPhysicalModuleId
+    ? heaterTelemetryHistory.get(selectedPhysicalModuleId) ?? []
+    : []
+  $: heaterSamplesInWindow = (() => {
+    if (!selectedHeaterSamples.length) return []
+    const cutoff = Date.now() - temperatureChartWindowMs
+    return selectedHeaterSamples.filter((sample) => sample.timestamp >= cutoff)
+  })()
+  $: temperatureSeries = buildTemperatureSeries(
+    heaterSamplesInWindow,
+    temperatureSetpointC,
+    heaterSetpointMinC,
+    heaterSetpointMaxC
+  )
+  $: temperatureChartDatasets = temperatureSeries.datasets
+  $: temperatureYAxisMin = temperatureSeries.yMin
+  $: temperatureYAxisMax = temperatureSeries.yMax
+  $: latestTemperatureSample = heaterSamplesInWindow.length
+    ? heaterSamplesInWindow[heaterSamplesInWindow.length - 1]
+    : null
+  $: temperatureChartMeta = buildTemperatureMeta(latestTemperatureSample, selectedModule)
+  $: primaryHeaterSamples = (() => {
+    if (!PRIMARY_HEATER_MODULE_ID) return []
+    for (const [moduleId, samples] of heaterTelemetryHistory.entries()) {
+      if (normalizeModuleId(moduleId) !== PRIMARY_HEATER_MODULE_ID) continue
+      return Array.isArray(samples) ? samples : []
+    }
+    return []
+  })()
+  $: primaryHeaterSample = primaryHeaterSamples.length
+    ? primaryHeaterSamples[primaryHeaterSamples.length - 1]
+    : null
+  $: heroCurrentTempC = computeSampleAverageC(primaryHeaterSample)
+  $: heroAverage3dTempC = (() => {
+    if (!primaryHeaterSamples.length) return null
+    const cutoff = Date.now() - HERO_AVERAGE_WINDOW_MS
+    const values = primaryHeaterSamples
+      .filter((sample) => sample.timestamp >= cutoff)
+      .map((sample) => computeSampleAverageC(sample))
+      .filter((value) => typeof value === 'number' && Number.isFinite(value))
+    if (!values.length) return null
+    const sum = values.reduce((total, value) => total + value, 0)
+    return sum / values.length
+  })()
+  $: alertEntries = hydratedModules.flatMap(buildModuleAlerts)
   $: sortedAlerts = [...alertEntries].sort((a, b) => {
     const left = severityOrder[a.severity] ?? 99
     const right = severityOrder[b.severity] ?? 99
@@ -1480,11 +2607,13 @@
     lastAlarmKeys = new Set(currentKeys)
   }
 
-  const openControls = (moduleId) => {
-    selectedModuleId = moduleId
-    const target = moduleCards.find((module) => module.module_id === moduleId)
-    if (target) {
-      prefillControls(target)
+  const openControls = (cardId) => {
+    selectedModuleId = cardId
+    purgeConfirming = false
+    const targetCard = moduleCards.find((module) => (module.card_id ?? module.module_id) === cardId)
+    if (targetCard) {
+      const physicalTarget = hydratedModules.find((module) => module.module_id === getCardModuleId(targetCard))
+      prefillControls(physicalTarget ?? targetCard)
     }
     controlsVisible = true
   }
@@ -1492,8 +2621,10 @@
   const closeControls = () => {
     controlsVisible = false
     spoolResetConfirming = false
+    tankRefillConfirming = false
     calibrationModalOpen = false
     spoolCalibrationAwaitingAck = false
+    purgeConfirming = false
     stopCalibrationAckPolling()
     if (controlUpdateTimer) {
       clearTimeout(controlUpdateTimer)
@@ -1505,6 +2636,66 @@
   const setUsageChartWindow = (hours) => {
     if (usageChartWindowHours === hours) return
     usageChartWindowHours = hours
+  }
+
+  const setTemperatureChartWindow = (hours) => {
+    if (temperatureChartWindowHours === hours) return
+    temperatureChartWindowHours = hours
+  }
+
+  const updateHeaterSetpointField = (kind, rawValue) => {
+    if (rawValue == null || rawValue === '') return null
+    const numeric = typeof rawValue === 'number' ? rawValue : Number(rawValue)
+    if (Number.isNaN(numeric)) return null
+    const clamped = clampSetpointValue(Number(numeric.toFixed(1)))
+    if (kind === 'target') {
+      temperatureSetpointC = clamped
+    } else if (kind === 'min') {
+      heaterSetpointMinC = clamped
+      if (heaterSetpointMaxC != null && heaterSetpointMinC > heaterSetpointMaxC) {
+        heaterSetpointMaxC = heaterSetpointMinC
+      }
+    } else if (kind === 'max') {
+      heaterSetpointMaxC = clamped
+      if (heaterSetpointMinC != null && heaterSetpointMaxC < heaterSetpointMinC) {
+        heaterSetpointMinC = heaterSetpointMaxC
+      }
+    }
+    return clamped
+  }
+
+  const handleSetpointInput = (kind, eventOrValue) => {
+    const raw =
+      typeof eventOrValue === 'object' && eventOrValue?.target
+        ? eventOrValue.target.value
+        : eventOrValue
+    const result = updateHeaterSetpointField(kind, raw)
+    if (result != null) {
+      scheduleControlUpdate()
+    }
+  }
+
+  const nudgeSetpointValue = (kind, delta) => {
+    if (typeof delta !== 'number') return
+    const baseline = (() => {
+      if (kind === 'min') {
+        if (typeof heaterSetpointMinC === 'number') return heaterSetpointMinC
+        if (typeof temperatureSetpointC === 'number') return temperatureSetpointC
+        return HEATER_SETPOINT_MIN_BOUND_C
+      }
+      if (kind === 'max') {
+        if (typeof heaterSetpointMaxC === 'number') return heaterSetpointMaxC
+        if (typeof temperatureSetpointC === 'number') return temperatureSetpointC
+        return HEATER_SETPOINT_MAX_BOUND_C
+      }
+      if (typeof temperatureSetpointC === 'number') return temperatureSetpointC
+      if (typeof heaterSetpointMinC === 'number' && typeof heaterSetpointMaxC === 'number') {
+        return (heaterSetpointMinC + heaterSetpointMaxC) / 2
+      }
+      return (HEATER_SETPOINT_MIN_BOUND_C + HEATER_SETPOINT_MAX_BOUND_C) / 2
+    })()
+    const next = Number((baseline + delta).toFixed(1))
+    handleSetpointInput(kind, next)
   }
 
   const setCycleChartWindow = (hours) => {
@@ -1519,7 +2710,7 @@
   }
 
   const submitControls = async () => {
-    if (!selectedModuleId) {
+    if (!selectedPhysicalModuleId) {
       controlError = 'Select a module first.'
       return
     }
@@ -1532,6 +2723,9 @@
     if (hasValue(rollerSpeed)) payload.roller_speed = Number(rollerSpeed)
     if (hasValue(pumpTimeoutMs)) payload.pump_timeout_ms = Number(pumpTimeoutMs)
     if (hasValue(alarmChirpIntervalMs)) payload.alarm_chirp_interval_ms = Number(alarmChirpIntervalMs)
+    if (hasValue(temperatureSetpointC)) payload.heater_setpoint_c = Number(temperatureSetpointC)
+    if (hasValue(heaterSetpointMinC)) payload.heater_setpoint_min_c = Number(heaterSetpointMinC)
+    if (hasValue(heaterSetpointMaxC)) payload.heater_setpoint_max_c = Number(heaterSetpointMaxC)
 
     if (Object.keys(payload).length === 0) {
       return
@@ -1541,7 +2735,7 @@
     controlError = ''
     controlMessage = ''
     try {
-      await updateModuleControls(selectedModuleId, payload)
+      await updateModuleControls(selectedPhysicalModuleId, payload)
       controlMessage = 'Settings sent to module.'
       await refresh()
     } catch (err) {
@@ -1566,7 +2760,7 @@
   }
 
   const confirmSpoolReset = async () => {
-    if (!selectedModuleId) {
+    if (!selectedPhysicalModuleId) {
       controlError = 'Select a module first.'
       spoolResetConfirming = false
       return
@@ -1576,7 +2770,7 @@
     controlError = ''
     controlMessage = ''
     try {
-      await updateModuleControls(selectedModuleId, { reset_spool: true })
+      await updateModuleControls(selectedPhysicalModuleId, { reset_spool: true })
       controlMessage = 'Spool reset command sent.'
       await refresh()
     } catch (err) {
@@ -1588,7 +2782,7 @@
   }
 
   const openCalibrationModal = () => {
-    if (!selectedModuleId) {
+    if (!selectedPhysicalModuleId) {
       controlError = 'Select a module first.'
       return
     }
@@ -1663,7 +2857,7 @@
   }
 
   const pushMediaProfileUpdate = async () => {
-    if (!selectedModuleId) {
+    if (!selectedPhysicalModuleId) {
       controlError = 'Select a module first.'
       return
     }
@@ -1693,7 +2887,7 @@
     controlError = ''
     controlMessage = ''
     try {
-      await updateModuleControls(selectedModuleId, {
+      await updateModuleControls(selectedPhysicalModuleId, {
         spool_length_mm: desiredLength,
         spool_media_thickness_um: desiredThickness,
         spool_core_diameter_mm: desiredCoreDiameter,
@@ -1708,7 +2902,7 @@
   }
 
   const startSpoolCalibration = async () => {
-    if (!selectedModuleId) {
+    if (!selectedPhysicalModuleId) {
       controlError = 'Select a module first.'
       return
     }
@@ -1718,7 +2912,7 @@
     controlError = ''
     controlMessage = ''
     try {
-      await updateModuleControls(selectedModuleId, { spool_calibrate_start: true })
+      await updateModuleControls(selectedPhysicalModuleId, { spool_calibrate_start: true })
       controlMessage = 'Calibration request sent. Waiting for module confirmation.'
       await refresh()
       startCalibrationAckPolling()
@@ -1731,7 +2925,7 @@
   }
 
   const finishSpoolCalibration = async () => {
-    if (!selectedModuleId) {
+    if (!selectedPhysicalModuleId) {
       controlError = 'Select a module first.'
       return
     }
@@ -1747,7 +2941,7 @@
     controlError = ''
     controlMessage = ''
     try {
-      await updateModuleControls(selectedModuleId, { spool_calibrate_finish: desiredLength })
+      await updateModuleControls(selectedPhysicalModuleId, { spool_calibrate_finish: desiredLength })
       controlMessage = 'Calibration complete. Spool usage reset.'
       await refresh()
       calibrationModalOpen = false
@@ -1761,7 +2955,7 @@
   }
 
   const cancelSpoolCalibration = async () => {
-    if (!selectedModuleId) {
+    if (!selectedPhysicalModuleId) {
       controlError = 'Select a module first.'
       return
     }
@@ -1770,7 +2964,7 @@
     controlError = ''
     controlMessage = ''
     try {
-      await updateModuleControls(selectedModuleId, { spool_calibrate_cancel: true })
+      await updateModuleControls(selectedPhysicalModuleId, { spool_calibrate_cancel: true })
       controlMessage = 'Calibration canceled.'
       await refresh()
       calibrationModalOpen = false
@@ -1783,8 +2977,73 @@
     }
   }
 
+  const startTankRefillConfirmation = () => {
+    controlError = ''
+    controlMessage = ''
+    tankRefillConfirming = true
+  }
+
+  const cancelTankRefillConfirmation = () => {
+    tankRefillConfirming = false
+  }
+
+  const triggerTankRefill = async () => {
+    if (!selectedPhysicalModuleId) {
+      controlError = 'Select a module first.'
+      return
+    }
+    tankRefillBusy = true
+    controlError = ''
+    controlMessage = ''
+    try {
+      await updateModuleControls(selectedPhysicalModuleId, { ato_tank_refill: 1 })
+      controlMessage = 'Tank reset to full.'
+      markTankReset(selectedPhysicalModuleId, Date.now())
+      await refresh()
+    } catch (err) {
+      controlError = err.message ?? 'Failed to mark tank as refilled.'
+    } finally {
+      tankRefillBusy = false
+      tankRefillConfirming = false
+    }
+  }
+
+  const startModulePurge = () => {
+    controlError = ''
+    controlMessage = ''
+    purgeConfirming = true
+  }
+
+  const cancelModulePurge = () => {
+    purgeConfirming = false
+  }
+
+  const confirmModulePurge = async () => {
+    if (!selectedPhysicalModuleId) {
+      controlError = 'Select a module first.'
+      purgeConfirming = false
+      return
+    }
+
+    purgeBusy = true
+    controlError = ''
+    controlMessage = ''
+    try {
+      await deleteModule(selectedPhysicalModuleId)
+      controlMessage = 'Module removed. It will show up again after it reconnects.'
+      purgeConfirming = false
+      controlsVisible = false
+      selectedModuleId = ''
+      await refresh()
+    } catch (err) {
+      controlError = err.message ?? 'Failed to purge module.'
+    } finally {
+      purgeBusy = false
+    }
+  }
+
   const scheduleControlUpdate = () => {
-    if (!selectedModuleId) return
+    if (!selectedPhysicalModuleId) return
     if (controlBusy) {
       controlUpdatePending = true
       return
@@ -1829,7 +3088,7 @@
                 <button
                   type="button"
                   class={`alert-pill ${alert.severity}`}
-                  on:click={() => (selectedModuleId = alert.moduleId)}
+                  on:click={() => focusModuleCard(alert.moduleId, guessSubsystemFromAlert(alert))}
                 >
                   <span class={`badge ${getSeverityMeta(alert.severity).badge}`}>
                     {getSeverityMeta(alert.severity).label}
@@ -1861,16 +3120,36 @@
 
   <section class="grid metrics">
     {#each Object.keys(metricCopy) as metric}
-      <article class="panel">
-        <header>
-          <p>{metricCopy[metric].label}</p>
-          <span>{formatValue(metric)}</span>
+      <article class="panel metric-card" class:metric-card--temperature={metric === 'temperature'}>
+        <header class="metric-card__header">
+          <div>
+            <p>{metricCopy[metric].label}</p>
+            {#if metric === 'temperature'}
+              <small>Source: PickleHeat</small>
+            {/if}
+          </div>
+          <span class={`metric-card__value ${metric === 'temperature' ? 'metric-card__value--xl' : ''}`}>
+            {formatValue(metric)}
+          </span>
         </header>
-        <footer>
-          <p>
-            Avg {metricCopy[metric].label.toLowerCase()}:
-            {summary.find((item) => item.metric === metric)?.avg_value?.toFixed(2) ?? '—'}
-          </p>
+        <footer class="metric-card__footer">
+          {#if metric === 'temperature'}
+            <p>
+              Avg (3d):
+              {#if heroAverage3dTempC != null}
+                {heroAverage3dTempC.toFixed(2)} {metricCopy[metric].unit}
+              {:else if summary.find((item) => item.metric === metric)?.avg_value != null}
+                {summary.find((item) => item.metric === metric)?.avg_value?.toFixed(2)} {metricCopy[metric].unit}
+              {:else}
+                —
+              {/if}
+            </p>
+          {:else}
+            <p>
+              Avg {metricCopy[metric].label.toLowerCase()}:
+              {summary.find((item) => item.metric === metric)?.avg_value?.toFixed(2) ?? '—'}
+            </p>
+          {/if}
         </footer>
       </article>
     {/each}
@@ -1889,10 +3168,21 @@
           <li class="placeholder">No modules have reported yet.</li>
         {:else}
           {#each moduleCards as module}
-            <li class="module-card">
+            <li
+              class="module-card"
+              class:selected={(module.card_id ?? module.module_id) === selectedModuleId}
+            >
               <div class="module-card__head">
                 <div>
-                  <p class="module-label">{module.label}</p>
+                  <p class="module-label">
+                    {module.label}
+                    {#if module.module_type}
+                      <span class={`module-type-pill ${moduleTypeClassName(module.module_type)}`}>
+                        {module.module_type}
+                      </span>
+                    {/if}
+                    <span class="module-subsystem-pill">{module.badge_label}</span>
+                  </p>
                   <p class="module-meta">{module.module_id}</p>
                 </div>
                 <div class="module-meta ip-meta">
@@ -1900,64 +3190,116 @@
                 </div>
                 <div class="module-card__actions">
                   <span class="pill {statusPalette[module.status] ?? ''}">{formatState(module.status)}</span>
-                  <button type="button" class="ghost small" on:click={() => openControls(module.module_id)}>
+                  <button
+                    type="button"
+                    class="ghost small"
+                    on:click={() => openControls(module.card_id ?? module.module_id)}
+                  >
                     Controls
                   </button>
                 </div>
               </div>
-              <div class="module-card__insights">
-                <div class="insight">
-                  <p>Filter</p>
-                  <strong>{formatState(module.motor.state)}</strong>
-                  <small>{formatMotorDetails(module.motor)}</small>
-                </div>
-                <div class="insight">
-                  <p>ATO</p>
-                  <strong>
-                    {#if module.ato.pump_running}
-                      Pump running
-                    {:else if module.ato.paused}
-                      Paused
-                    {:else}
-                      Pump idle
-                    {/if}
-                  </strong>
-                  <small>{describePump(module.ato)}</small>
-                </div>
-                <div class="insight">
-                  <p>Floats</p>
-                  <div class="float-pills">
-                    {#each floatIndicators as indicator}
-                      <span class:active={module.floats[indicator.key]}>{indicator.label}</span>
-                    {/each}
+              <div class="module-card__insights" class:heater-layout={isHeaterCard(module)}>
+                {#if isHeaterCard(module)}
+                  <div class="insight">
+                    <p>{module.heater_summary?.thermometers?.[0]?.label ?? 'Thermometer 1'}</p>
+                    <strong>{formatThermometerReading(module.heater_summary?.thermometers?.[0])}</strong>
+                    <small>Primary probe</small>
                   </div>
-                </div>
-                <div class="insight spool-insight">
-                  <p>Spool</p>
-                  <strong class:alarm={module.spool.empty_alarm}>
-                    {module.spool.empty_alarm ? 'Empty' : formatSpoolPercent(module.spool)}
-                  </strong>
-                  <small>{describeSpool(module.spool)}</small>
-                  <div
-                    class="spool-meter"
-                    role="progressbar"
-                    aria-label="Remaining filter media"
-                    aria-valuemin="0"
-                    aria-valuemax="100"
-                    aria-valuenow={normalizedSpoolPercent(module.spool) ?? 0}
-                  >
-                    <span
-                      class:low={isSpoolLow(module.spool)}
-                      class:empty={module.spool.empty_alarm}
-                      style={`width: ${spoolMeterWidth(module.spool)}%;`}
-                    ></span>
+                  <div class="insight">
+                    <p>{module.heater_summary?.thermometers?.[1]?.label ?? 'Thermometer 2'}</p>
+                    <strong>{formatThermometerReading(module.heater_summary?.thermometers?.[1])}</strong>
+                    <small>Secondary probe</small>
                   </div>
-                </div>
-                <div class="insight">
-                  <p>Uptime</p>
-                  <strong>{formatDuration(module.system.uptime_s)}</strong>
-                  <small>Last seen {formatTimestamp(module.last_seen)}</small>
-                </div>
+                  <div class="insight">
+                    <p>Heater state</p>
+                    <strong class:active={module.heater_summary?.heaterState?.active}>
+                      {module.heater_summary?.heaterState?.label ?? '—'}
+                    </strong>
+                    <small>{module.heater_summary?.heaterState?.description ?? 'Waiting for heater telemetry'}</small>
+                  </div>
+                  <div class="insight">
+                    <p>Duty / min</p>
+                    <strong>{formatDutyCycleLabel(module.heater_summary?.dutyPercent)}</strong>
+                    <small>Rolling 60-second average</small>
+                  </div>
+                {:else if isRollerSubsystem(module.subsystem)}
+                  <div class="insight">
+                    <p>Filter</p>
+                    <strong>{formatState(module.motor.state)}</strong>
+                    <small>{formatMotorDetails(module.motor)}</small>
+                  </div>
+                  <div class="insight spool-insight">
+                    <p>Spool</p>
+                    <strong class:alarm={module.spool.empty_alarm}>
+                      {module.spool.empty_alarm ? 'Empty' : formatSpoolPercent(module.spool)}
+                    </strong>
+                    <small>{describeSpool(module.spool)}</small>
+                    <div
+                      class="spool-meter"
+                      role="progressbar"
+                      aria-label="Remaining filter media"
+                      aria-valuemin="0"
+                      aria-valuemax="100"
+                      aria-valuenow={normalizedSpoolPercent(module.spool) ?? 0}
+                    >
+                      <span
+                        class:low={isSpoolLow(module.spool)}
+                        class:empty={module.spool.empty_alarm}
+                        style={`width: ${spoolMeterWidth(module.spool)}%;`}
+                      ></span>
+                    </div>
+                  </div>
+                  <div class="insight">
+                    <p>Uptime</p>
+                    <strong>{formatDuration(module.system.uptime_s)}</strong>
+                    <small>Last seen {formatTimestamp(module.last_seen)}</small>
+                  </div>
+                {:else}
+                  <div class="insight">
+                    <p>ATO pump</p>
+                    <strong>{module.ato.pump_running ? 'Filling' : 'Idle'}</strong>
+                    <small>{describePump(module.ato)}</small>
+                  </div>
+                  <div class="insight">
+                    <p>ATO mode</p>
+                    <strong>{describeAtoMode(module.ato)}</strong>
+                    <small>{module.ato.manual_mode ? 'Manual override ready' : 'Automatic sensing'}</small>
+                  </div>
+                  <div class="insight tank-insight">
+                    <p>Reservoir</p>
+                    <strong class:alarm={isTankLow(module.ato)}>{formatTankPercent(module.ato)}</strong>
+                    <small>{describeTankVolume(module.ato)}</small>
+                    <div
+                      class="tank-meter"
+                      role="progressbar"
+                      aria-label="ATO reservoir level"
+                      aria-valuemin="0"
+                      aria-valuemax="100"
+                      aria-valuenow={computeTankPercent(module.ato) ?? 0}
+                    >
+                      <span class:low={isTankLow(module.ato)} style={`width: ${tankMeterWidth(module.ato)}%;`}></span>
+                    </div>
+                  </div>
+                  <div class="insight">
+                    <p>Timeout window</p>
+                    <strong>{formatCycleDuration(deriveModulePumpTimeout(module))}</strong>
+                    <small>Alerts every {formatChirpInterval(deriveModuleChirpInterval(module))}</small>
+                  </div>
+                  <div class="insight">
+                    <p>Floats</p>
+                    <div class="float-pills">
+                      {#each floatIndicators as indicator}
+                        <span class:active={module.floats[indicator.key]}>{indicator.label}</span>
+                      {/each}
+                    </div>
+                  </div>
+                  <div class="insight">
+                    <p>Uptime</p>
+                    <strong>{formatDuration(module.system.uptime_s)}</strong>
+                    <small>Last seen {formatTimestamp(module.last_seen)}</small>
+                  </div>
+                {/if}
               </div>
             </li>
           {/each}
@@ -1982,7 +3324,7 @@
         activeValue={usageChartWindowHours}
         on:select={(event) => setUsageChartWindow(event.detail)}
       >
-        {#if !selectedModuleId}
+        {#if !selectedPhysicalModuleId}
           <div class="chart-widget__placeholder">
             <p class="placeholder">Select a module to track filter usage.</p>
           </div>
@@ -2015,26 +3357,114 @@
         {/if}
 
         <svelte:fragment slot="meta">
-          {#if selectedModuleId}
+          {#if selectedPhysicalModuleId}
             <div class="chart-meta usage-meta">
-              <div>
-                <p>Media used (spool)</p>
-                <strong>{formatSpoolMediaLength(spoolLifetimeUsageMm)}</strong>
-                <small>{spoolMetricSubcopy}</small>
+              <div class="chart-meta__context">
+                <p>Data - since last refill on:</p>
+                <strong>{formatBaselineTimestamp(spoolBaselineTimestamp)}</strong>
               </div>
               <div>
-                <p>Avg per activation</p>
+                <p>Activations (spool)</p>
+                <strong>{spoolLifetimeActivationCount ?? '—'}</strong>
+              </div>
+              <div>
+                <p>Avg media use</p>
                 <strong>
                   {spoolAverageActivationLengthMm != null
                     ? formatSpoolMediaLength(spoolAverageActivationLengthMm)
                     : '—'}
                 </strong>
-                <small>{spoolMetricSubcopy}</small>
               </div>
               <div>
-                <p>Activations (spool)</p>
-                <strong>{spoolLifetimeActivationCount ?? '—'}</strong>
-                <small>{spoolMetricSubcopy}</small>
+                <p>Total media used</p>
+                <strong>{formatSpoolMediaLength(spoolLifetimeUsageMm)}</strong>
+              </div>
+            </div>
+          {/if}
+        </svelte:fragment>
+      </ChartWidget>
+
+      <ChartWidget
+        ariaLabel="Heater temperature history"
+        label="Heater window"
+        description={describeUsageWindow(temperatureChartWindowHours)}
+        buttons={temperatureWindowButtons}
+        activeValue={temperatureChartWindowHours}
+        on:select={(event) => setTemperatureChartWindow(event.detail)}
+      >
+        {#if !selectedPhysicalModuleId}
+          <div class="chart-widget__placeholder">
+            <p class="placeholder">Select a module to visualize heater telemetry.</p>
+          </div>
+        {:else if loading && !temperatureChartDatasets.length}
+          <div class="chart-widget__placeholder">
+            <p class="placeholder">Loading heater telemetry…</p>
+          </div>
+        {:else if !temperatureChartDatasets.length}
+          <div class="chart-widget__placeholder">
+            <p class="placeholder">
+              No heater telemetry captured in the last {formatUsageWindowShort(temperatureChartWindowHours)}.
+            </p>
+          </div>
+        {:else}
+          <LineChart
+            datasets={temperatureChartDatasets}
+            ariaLabel="Heater temperature chart"
+            yTitle="Temperature (°C)"
+            xTitle="Time"
+            xTickFormatter={formatCycleTimestamp}
+            tooltipFormatter={temperatureTooltipFormatter}
+            height={320}
+            fontSize={16}
+            fontWeight="600"
+            tickColor="rgba(255, 255, 255, 0.95)"
+            gridColor="rgba(255, 255, 255, 0.2)"
+            yBeginAtZero={false}
+            yMin={temperatureYAxisMin}
+            yMax={temperatureYAxisMax}
+            showLegend={true}
+          />
+        {/if}
+
+        <svelte:fragment slot="controls">
+          <label class="setpoint-control" for="temperature-setpoint">
+            <span>Setpoint</span>
+            <div class="setpoint-control__input">
+              <input
+                id="temperature-setpoint"
+                type="number"
+                min={HEATER_SETPOINT_MIN_BOUND_C}
+                max={HEATER_SETPOINT_MAX_BOUND_C}
+                step="0.1"
+                bind:value={temperatureSetpointC}
+                inputmode="decimal"
+                aria-label="Temperature setpoint"
+                on:input={(event) => handleSetpointInput('target', event)}
+              />
+              <span class="unit">°C</span>
+            </div>
+          </label>
+        </svelte:fragment>
+
+        <svelte:fragment slot="meta">
+          {#if temperatureChartMeta}
+            <div class="chart-meta temperature-meta">
+              <div>
+                <p>Last sample</p>
+                <strong>{formatTimestamp(temperatureChartMeta.timestamp)}</strong>
+              </div>
+              {#each temperatureChartMeta.readings as reading}
+                <div>
+                  <p>{reading.label}</p>
+                  <strong>{formatCelsiusValue(reading.value)}</strong>
+                </div>
+              {/each}
+              <div>
+                <p>Heater</p>
+                <strong class:active={temperatureChartMeta.heaterOn}>
+                  {temperatureChartMeta.heaterOn ? 'Heating' : 'Idle'}
+                </strong>
+                <small>{temperatureChartMeta.description || 'Awaiting heater telemetry'}</small>
               </div>
             </div>
           {/if}
@@ -2055,21 +3485,21 @@
           </button>
         </svelte:fragment>
 
-        {#if cycleHistoryLoading}
+        {#if cycleHistoryLoading && !atoChartPoints.length}
           <div class="chart-widget__placeholder">
-            <p class="placeholder">Loading ATO history…</p>
+            <p class="placeholder">Loading ATO water usage…</p>
           </div>
-        {:else if !atoRuns.length}
+        {:else if !atoChartPoints.length}
           <div class="chart-widget__placeholder">
-            <p class="placeholder">No ATO activity in this window.</p>
+            <p class="placeholder">No ATO water usage in this window.</p>
           </div>
         {:else}
           <LineChart
             datasets={atoChartDatasets}
-            ariaLabel="ATO cycles chart"
-            yTitle="Runtime"
+            ariaLabel="ATO water usage chart"
+            yTitle="Water pumped"
             xTitle="Time"
-            yTickFormatter={formatCycleDuration}
+            yTickFormatter={formatMilliliters}
             xTickFormatter={formatCycleTimestamp}
             tooltipFormatter={atoTooltipFormatter}
             ySuggestedMax={atoYAxisMax}
@@ -2083,20 +3513,29 @@
 
         <svelte:fragment slot="meta">
           <div class="chart-meta">
-            <div>
-              <p>ATO cycles</p>
-              <strong>{atoStats.count}</strong>
-              <small>{atoStats.frequency_per_hour?.toFixed(2) ?? '0.00'} /hr</small>
+            <div class="chart-meta__context">
+              <p>Data - since last refill on:</p>
+              <strong>{formatBaselineTimestamp(tankLastRefillTimestamp)}</strong>
             </div>
             <div>
-              <p>Avg fill time</p>
-              <strong>{formatCycleDuration((atoStats.avg_fill_seconds ?? 0) * 1000)}</strong>
-              <small>Min → Max</small>
+              <p>ATO activations</p>
+              <strong>{atoLifetimeActivationCount ?? atoStats.count ?? '—'}</strong>
             </div>
             <div>
-              <p>Avg runtime</p>
-              <strong>{formatCycleDuration(atoStats.avg_duration_ms)}</strong>
-              <small>Per pump cycle</small>
+              <p>Avg water per activation</p>
+              <strong>
+                {atoAverageSinceRefillMl != null
+                  ? formatMilliliters(atoAverageSinceRefillMl)
+                  : formatMilliliters(atoStats.avg_volume_ml ?? 0)}
+              </strong>
+            </div>
+            <div>
+              <p>Water used</p>
+              <strong>
+                {atoWaterUsedSinceRefillMl != null
+                  ? formatMilliliters(atoWaterUsedSinceRefillMl)
+                  : formatMilliliters(atoStats.total_volume_ml ?? 0)}
+              </strong>
             </div>
           </div>
         </svelte:fragment>
@@ -2192,9 +3631,21 @@
     <div class="control-drawer" role="dialog" aria-modal="true">
       <header>
         <div>
-          <p class="section-label">Module Controls</p>
-          <h2>{selectedModule?.label ?? 'Select a module'}</h2>
-          <small>{selectedModuleId}</small>
+          <p class="section-label">
+            {#if selectedCard}
+              {#if isHeaterView}
+                Heater Controls
+              {:else if isAtoView}
+                ATO Controls
+              {:else}
+                Roller Controls
+              {/if}
+            {:else}
+              Module Controls
+            {/if}
+          </p>
+          <h2>{selectedCard?.label ?? selectedModule?.label ?? 'Select a module'}</h2>
+          <small>{selectedPhysicalModuleId}</small>
         </div>
         <button type="button" class="ghost close" on:click={closeControls} aria-label="Close controls">
           ×
@@ -2203,191 +3654,475 @@
       <section class="control-form">
         <small class="control-hint">Changes sync automatically as you adjust settings.</small>
 
-        <div class="form-group">
-          <p class="form-label">ATO mode</p>
-          <div class="radio-group" on:change={scheduleControlUpdate}>
-            <label><input type="radio" name="ato-mode" value="auto" bind:group={atoMode} /> Auto</label>
-            <label><input type="radio" name="ato-mode" value="manual" bind:group={atoMode} /> Manual</label>
-            <label><input type="radio" name="ato-mode" value="paused" bind:group={atoMode} /> Pause</label>
+        {#if isHeaterView}
+          <div class="form-group heater-setpoints">
+            <div class="form-label-row">
+              <p class="form-label">Setpoint band</p>
+              <span class="length-meta">
+                Target {temperatureSetpointC != null ? formatCelsiusValue(temperatureSetpointC) : '—'}
+              </span>
+            </div>
+            <small>Define the temperature window the heater firmware should hold before toggling output.</small>
+            <div class="touch-input primary-touch-input">
+              <button
+                type="button"
+                class="touch-input__button"
+                aria-label="Decrease target setpoint"
+                on:click={() => nudgeSetpointValue('target', -0.1)}
+              >
+                −
+              </button>
+              <div class="length-input">
+                <input
+                  type="number"
+                  min={HEATER_SETPOINT_MIN_BOUND_C}
+                  max={HEATER_SETPOINT_MAX_BOUND_C}
+                  step="0.1"
+                  bind:value={temperatureSetpointC}
+                  inputmode="decimal"
+                  placeholder="25.0"
+                  aria-label="Target heater setpoint"
+                  on:input={(event) => handleSetpointInput('target', event)}
+                />
+                <span>°C</span>
+              </div>
+              <button
+                type="button"
+                class="touch-input__button"
+                aria-label="Increase target setpoint"
+                on:click={() => nudgeSetpointValue('target', 0.1)}
+              >
+                +
+              </button>
+            </div>
+            <div class="setpoint-range">
+              <label>
+                <span>Minimum</span>
+                <div class="touch-input">
+                  <button
+                    type="button"
+                    class="touch-input__button"
+                    aria-label="Decrease minimum setpoint"
+                    on:click={() => nudgeSetpointValue('min', -0.1)}
+                  >
+                    −
+                  </button>
+                  <div class="length-input">
+                    <input
+                      type="number"
+                      min={HEATER_SETPOINT_MIN_BOUND_C}
+                      max={HEATER_SETPOINT_MAX_BOUND_C}
+                      step="0.1"
+                      bind:value={heaterSetpointMinC}
+                      inputmode="decimal"
+                      placeholder="24.5"
+                      aria-label="Minimum setpoint"
+                      on:input={(event) => handleSetpointInput('min', event)}
+                    />
+                    <span>°C</span>
+                  </div>
+                  <button
+                    type="button"
+                    class="touch-input__button"
+                    aria-label="Increase minimum setpoint"
+                    on:click={() => nudgeSetpointValue('min', 0.1)}
+                  >
+                    +
+                  </button>
+                </div>
+              </label>
+              <label>
+                <span>Maximum</span>
+                <div class="touch-input">
+                  <button
+                    type="button"
+                    class="touch-input__button"
+                    aria-label="Decrease maximum setpoint"
+                    on:click={() => nudgeSetpointValue('max', -0.1)}
+                  >
+                    −
+                  </button>
+                  <div class="length-input">
+                    <input
+                      type="number"
+                      min={HEATER_SETPOINT_MIN_BOUND_C}
+                      max={HEATER_SETPOINT_MAX_BOUND_C}
+                      step="0.1"
+                      bind:value={heaterSetpointMaxC}
+                      inputmode="decimal"
+                      placeholder="25.5"
+                      aria-label="Maximum setpoint"
+                      on:input={(event) => handleSetpointInput('max', event)}
+                    />
+                    <span>°C</span>
+                  </div>
+                  <button
+                    type="button"
+                    class="touch-input__button"
+                    aria-label="Increase maximum setpoint"
+                    on:click={() => nudgeSetpointValue('max', 0.1)}
+                  >
+                    +
+                  </button>
+                </div>
+              </label>
+            </div>
           </div>
-        </div>
+        {/if}
 
-        <div class="form-group">
-          <label for="motor-runtime">Roller runtime ({(motorRunTimeMs / 1000).toFixed(1)}s)</label>
-          <input
-            id="motor-runtime"
-            type="range"
-            min="1000"
-            max="30000"
-            step="500"
-            bind:value={motorRunTimeMs}
-            on:change={scheduleControlUpdate}
-          />
-          <small>Adjusts how long the roller advances after a trigger.</small>
-        </div>
-
-        <div class="form-group">
-          <label for="roller-speed">Roller speed ({rollerSpeed})</label>
-          <input
-            id="roller-speed"
-            type="range"
-            min="50"
-            max="255"
-            step="1"
-            bind:value={rollerSpeed}
-            on:change={scheduleControlUpdate}
-          />
-          <small>Sets the roller motor PWM ceiling (firmware clamps to 50–255).</small>
-        </div>
-
-        <div class="form-group">
-          <label for="pump-timeout">Pump timeout ({(pumpTimeoutMs / 60000).toFixed(1)} min)</label>
-          <input
-            id="pump-timeout"
-            type="range"
-            min="60000"
-            max="600000"
-            step="5000"
-            bind:value={pumpTimeoutMs}
-            on:change={scheduleControlUpdate}
-          />
-          <small>How long the pump keeps running after a trigger to reach the high float target.</small>
-        </div>
-
-        <div class="form-group">
-          <label for="alarm-interval">Alarm chirp interval ({formatChirpInterval(alarmChirpIntervalMs)})</label>
-          <input
-            id="alarm-interval"
-            type="range"
-            min="30000"
-            max="600000"
-            step="5000"
-            bind:value={alarmChirpIntervalMs}
-            on:change={scheduleControlUpdate}
-          />
-          <small>Sets how often the buzzer repeats reminders while any roller/pump alarm is active.</small>
-        </div>
-
-        <div class="form-group spool-length">
-          <div class="form-label-row">
-            <p class="form-label">Roll length</p>
-            <span class="length-meta">Stored {formatMillimeters(spoolTotalLengthMm)}</span>
+        {#if isAtoView}
+          <div class="form-group">
+            <p class="form-label">ATO mode</p>
+            <div class="radio-group" on:change={scheduleControlUpdate}>
+              <label><input type="radio" name="ato-mode" value="auto" bind:group={atoMode} /> Auto</label>
+              <label><input type="radio" name="ato-mode" value="manual" bind:group={atoMode} /> Manual</label>
+              <label><input type="radio" name="ato-mode" value="paused" bind:group={atoMode} /> Pause</label>
+            </div>
           </div>
-          <div class="length-input">
+
+          <div class="form-group">
+            <label for="pump-timeout">Pump timeout ({(pumpTimeoutMs / 60000).toFixed(1)} min)</label>
             <input
-              id="roll-length"
-              type="number"
-              min={SPOOL_LENGTH_MIN_MM}
-              max={SPOOL_LENGTH_MAX_MM}
-              step="500"
-              bind:value={spoolLengthMm}
-              placeholder="50000"
+              id="pump-timeout"
+              type="range"
+              min="60000"
+              max="600000"
+              step="5000"
+              bind:value={pumpTimeoutMs}
+              on:change={scheduleControlUpdate}
             />
-            <span>mm</span>
+            <small>How long the pump keeps running after a trigger to reach the high float target.</small>
           </div>
-          <small>
-            Used when finishing calibration or when you know the exact roll specification.
-          </small>
-          <div class="form-label-row">
-            <p class="form-label">Core diameter</p>
-            <span class="length-meta">Stored {formatMillimeters(spoolCoreDiameterMm)}</span>
-          </div>
-          <div class="length-input">
-            <input
-              id="core-diameter"
-              type="number"
-              min={CORE_DIAMETER_MIN_MM}
-              max={CORE_DIAMETER_MAX_MM}
-              step="0.5"
-              bind:value={coreDiameterMm}
-              placeholder="19"
-            />
-            <span>mm</span>
-          </div>
-          <small>
-            Matches the mechanical hub or adapter your roll rides on (factory shaft is 19 mm).
-          </small>
-          <div class="form-label-row">
-            <p class="form-label">Media thickness</p>
-            <span class="length-meta">Stored {formatMicrons(spoolMediaThicknessUm)}</span>
-          </div>
-          <div class="length-input">
-            <input
-              id="media-thickness"
-              type="number"
-              min={MEDIA_THICKNESS_MIN_UM}
-              max={MEDIA_THICKNESS_MAX_UM}
-              step="1"
-              bind:value={mediaThicknessUm}
-              placeholder="100"
-            />
-            <span>um</span>
-          </div>
-          <small>
-            Defaults to 100 um for ~80 gsm paper. Adjust if you swap to thicker or thinner media so usage estimates stay accurate.
-          </small>
-          <button
-            type="button"
-            class="primary"
-            on:click={pushMediaProfileUpdate}
-            disabled={!selectedModuleId || mediaProfileBusy}
-          >
-            {mediaProfileBusy ? 'Saving…' : 'Save media profile'}
-          </button>
-        </div>
 
-        <div class="form-group spool-calibration">
-          <div class="form-label-row">
-            <p class="form-label">Automatic spool calibration</p>
-            <span
-              class={`calibration-pill ${spoolCalibrating ? 'active' : spoolCalibrationAwaitingAck ? 'pending' : ''}`}
-            >
-              {#if spoolCalibrating}
-                Calibrating
-              {:else if spoolCalibrationAwaitingAck}
-                Waiting
-              {:else}
-                Idle
-              {/if}
-            </span>
+          <div class="form-group">
+            <label for="alarm-interval">Alarm chirp interval ({formatChirpInterval(alarmChirpIntervalMs)})</label>
+            <input
+              id="alarm-interval"
+              type="range"
+              min="30000"
+              max="600000"
+              step="5000"
+              bind:value={alarmChirpIntervalMs}
+              on:change={scheduleControlUpdate}
+            />
+            <small>Sets how often the buzzer repeats reminders while any roller/pump alarm is active.</small>
           </div>
-          <small class="calibration-hint">
-            {#if spoolCalibrating}
-              Module ready. Pull {formatMeters(spoolSampleLengthMm)} of media, then finish to store
-              {formatMillimeters(spoolLengthMm)}.
-            {:else if spoolCalibrationAwaitingAck}
-              Waiting for the module to confirm calibration mode.
+
+          <div class="form-group tank-topup">
+            <div class="form-label-row">
+              <p class="form-label">Reservoir top-up</p>
+              <span class="length-meta">
+                Tank {formatMilliliters(coalesceNumber(selectedModule?.ato?.tank_capacity_ml))}
+              </span>
+            </div>
+            <small>Use this after every full refill so the firmware resets its reservoir estimate.</small>
+            {#if tankRefillConfirming}
+              <div class="reset-actions">
+                <p>This cannot be undone. Reset reservoir telemetry to 100%?</p>
+                <div class="button-row">
+                  <button
+                    type="button"
+                    class="ghost"
+                    on:click={cancelTankRefillConfirmation}
+                    disabled={tankRefillBusy}
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    type="button"
+                    class="danger"
+                    on:click={triggerTankRefill}
+                    disabled={!selectedPhysicalModuleId || tankRefillBusy}
+                  >
+                    {tankRefillBusy ? 'Marking…' : 'Confirm refill'}
+                  </button>
+                </div>
+              </div>
             {:else}
-              Launch the guided calibration flow to start, finish, or abort the 10 m sample pull.
+              <button
+                type="button"
+                class="danger"
+                on:click={startTankRefillConfirmation}
+                disabled={!selectedPhysicalModuleId || tankRefillBusy}
+              >
+                Mark full top-up
+              </button>
             {/if}
-          </small>
-          <button
-            type="button"
-            class="primary"
-            on:click={openCalibrationModal}
-            disabled={!selectedModuleId || spoolCalibrationBusy}
-          >
-            Open calibration flow
-          </button>
-        </div>
+          </div>
+        {/if}
 
-        <div class="form-group spool-reset">
-          <p class="form-label">Filter roll reset</p>
-          <small>Zero the spool usage meter after installing a new roll.</small>
-          {#if spoolResetConfirming}
+        {#if isRollerView}
+          <div class="form-group">
+            <label for="motor-runtime">Roller runtime ({(motorRunTimeMs / 1000).toFixed(1)}s)</label>
+            <input
+              id="motor-runtime"
+              type="range"
+              min="1000"
+              max="30000"
+              step="500"
+              bind:value={motorRunTimeMs}
+              on:change={scheduleControlUpdate}
+            />
+            <small>Adjusts how long the roller advances after a trigger.</small>
+          </div>
+
+          <div class="form-group">
+            <label for="roller-speed">Roller speed ({rollerSpeed})</label>
+            <input
+              id="roller-speed"
+              type="range"
+              min="50"
+              max="255"
+              step="1"
+              bind:value={rollerSpeed}
+              on:change={scheduleControlUpdate}
+            />
+            <small>Sets the roller motor PWM ceiling (firmware clamps to 50–255).</small>
+          </div>
+
+          <div class="form-group spool-length">
+            <div class="form-label-row">
+              <p class="form-label">Roll length</p>
+              <span class="length-meta">Stored {formatMillimeters(spoolTotalLengthMm)}</span>
+            </div>
+            <div class="length-input">
+              <input
+                id="roll-length"
+                type="number"
+                min={SPOOL_LENGTH_MIN_MM}
+                max={SPOOL_LENGTH_MAX_MM}
+                step="500"
+                bind:value={spoolLengthMm}
+                placeholder="50000"
+              />
+              <span>mm</span>
+            </div>
+            <small>
+              Used when finishing calibration or when you know the exact roll specification.
+            </small>
+            <div class="form-label-row">
+              <p class="form-label">Core diameter</p>
+              <span class="length-meta">Stored {formatMillimeters(spoolCoreDiameterMm)}</span>
+            </div>
+            <div class="length-input">
+              <input
+                id="core-diameter"
+                type="number"
+                min={CORE_DIAMETER_MIN_MM}
+                max={CORE_DIAMETER_MAX_MM}
+                step="0.5"
+                bind:value={coreDiameterMm}
+                placeholder="19"
+              />
+              <span>mm</span>
+            </div>
+            <small>
+              Matches the mechanical hub or adapter your roll rides on (factory shaft is 19 mm).
+            </small>
+            <div class="form-label-row">
+              <p class="form-label">Media thickness</p>
+              <span class="length-meta">Stored {formatMicrons(spoolMediaThicknessUm)}</span>
+            </div>
+            <div class="length-input">
+              <input
+                id="media-thickness"
+                type="number"
+                min={MEDIA_THICKNESS_MIN_UM}
+                max={MEDIA_THICKNESS_MAX_UM}
+                step="1"
+                bind:value={mediaThicknessUm}
+                placeholder="100"
+              />
+              <span>um</span>
+            </div>
+            <small>
+              Defaults to 100 um for ~80 gsm paper. Adjust if you swap to thicker or thinner media so usage estimates stay accurate.
+            </small>
+            <button
+              type="button"
+              class="primary"
+              on:click={pushMediaProfileUpdate}
+              disabled={!selectedPhysicalModuleId || mediaProfileBusy}
+            >
+              {mediaProfileBusy ? 'Saving…' : 'Save media profile'}
+            </button>
+          </div>
+
+          <div class="form-group spool-calibration">
+            <div class="form-label-row">
+              <p class="form-label">Automatic spool calibration</p>
+              <span
+                class={`calibration-pill ${spoolCalibrating ? 'active' : spoolCalibrationAwaitingAck ? 'pending' : ''}`}
+              >
+                {#if spoolCalibrating}
+                  Calibrating
+                {:else if spoolCalibrationAwaitingAck}
+                  Waiting
+                {:else}
+                  Idle
+                {/if}
+              </span>
+            </div>
+            <small class="calibration-hint">
+              {#if spoolCalibrating}
+                Module ready. Pull {formatMeters(spoolSampleLengthMm)} of media, then finish to store
+                {formatMillimeters(spoolLengthMm)}.
+              {:else if spoolCalibrationAwaitingAck}
+                Waiting for the module to confirm calibration mode.
+              {:else}
+                Launch the guided calibration flow to start, finish, or abort the 10 m sample pull.
+              {/if}
+            </small>
+            <button
+              type="button"
+              class="primary"
+              on:click={openCalibrationModal}
+              disabled={!selectedPhysicalModuleId || spoolCalibrationBusy}
+            >
+              Open calibration flow
+            </button>
+          </div>
+
+          <div class="form-group spool-reset">
+            <p class="form-label">Filter roll reset</p>
+            <small>Zero the spool usage meter after installing a new roll.</small>
+            {#if spoolResetConfirming}
+              <div class="reset-actions">
+                <p>This cannot be undone. Reset spool telemetry to 100%?</p>
+                <div class="button-row">
+                  <button type="button" class="ghost" on:click={cancelSpoolReset} disabled={spoolResetBusy}>
+                    Cancel
+                  </button>
+                  <button
+                    type="button"
+                    class="danger"
+                    on:click={confirmSpoolReset}
+                    disabled={spoolResetBusy || !selectedPhysicalModuleId}
+                  >
+                    {spoolResetBusy ? 'Resetting…' : 'Confirm reset'}
+                  </button>
+                </div>
+              </div>
+            {:else}
+              <button
+                type="button"
+                class="danger"
+                on:click={startSpoolReset}
+                disabled={!selectedPhysicalModuleId || controlBusy}
+              >
+                Reset spool meter
+              </button>
+            {/if}
+          </div>
+
+          {#if calibrationModalOpen}
+            <div
+              class="calibration-modal-backdrop"
+              on:click|self={closeCalibrationModal}
+              on:keydown|self={(event) => event.key === 'Escape' && closeCalibrationModal()}
+              role="dialog"
+              aria-modal="true"
+              tabindex="0"
+            >
+              <div class="calibration-modal" role="dialog" aria-modal="true">
+                <header>
+                  <div>
+                    <p class="section-label">Spool Calibration</p>
+                    <h3>Guided 10 m pull</h3>
+                  </div>
+                  <button type="button" class="ghost close" on:click={closeCalibrationModal}>
+                    ×
+                  </button>
+                </header>
+                <div class="calibration-status-block">
+                  <span
+                    class={`calibration-pill ${spoolCalibrating ? 'active' : spoolCalibrationAwaitingAck ? 'pending' : ''}`}
+                  >
+                    {calibrationStatusText}
+                  </span>
+                  <p class="calibration-instruction">{calibrationInstruction}</p>
+                  <div class="calibration-meta">
+                    <span>Sample: {formatMillimeters(spoolSampleLengthMm)}</span>
+                    <span>Roll length: {formatMillimeters(spoolLengthMm)}</span>
+                    <span>Media thickness: {formatMicrons(spoolMediaThicknessUm)}</span>
+                    {#if spoolCoreDiameterMm}
+                      <span>Core diameter: {formatMillimeters(spoolCoreDiameterMm)}</span>
+                    {/if}
+                    {#if spoolFullEdges}
+                      <span>Full-roll edges: {formatEdgeCount(spoolFullEdges)}</span>
+                    {/if}
+                    {#if spoolMmPerEdge}
+                      <span>Resolution: {formatMmPerEdge(spoolMmPerEdge)}</span>
+                    {/if}
+                    {#if spoolUsedEdges != null}
+                      <span>Edges used: {formatEdgeCount(spoolUsedEdges)}</span>
+                    {/if}
+                    {#if spoolRemainingEdges != null}
+                      <span>Edges remaining: {formatEdgeCount(spoolRemainingEdges)}</span>
+                    {/if}
+                  </div>
+                </div>
+                <div class="button-row calibration-actions">
+                  <button
+                    type="button"
+                    class="primary"
+                    on:click={startSpoolCalibration}
+                    disabled={
+                      !selectedPhysicalModuleId || spoolCalibrationBusy || spoolCalibrating || spoolCalibrationAwaitingAck
+                    }
+                  >
+                    {spoolCalibrationBusy && !spoolCalibrating ? 'Working…' : 'Request start'}
+                  </button>
+                  <button
+                    type="button"
+                    class="success"
+                    on:click={finishSpoolCalibration}
+                    disabled={!selectedPhysicalModuleId || spoolCalibrationBusy || !spoolCalibrating}
+                  >
+                    {spoolCalibrationBusy && spoolCalibrating ? 'Working…' : 'Finish & save'}
+                  </button>
+                  <button
+                    type="button"
+                    class="danger"
+                    on:click={cancelSpoolCalibration}
+                    disabled={
+                      !selectedPhysicalModuleId || spoolCalibrationBusy || (!spoolCalibrating && !spoolCalibrationAwaitingAck)
+                    }
+                  >
+                    Cancel calibration
+                  </button>
+                </div>
+                <small class="calibration-note">
+                  Adjust the target roll length above before finishing if the replacement roll differs.
+                </small>
+                {#if controlError}
+                  <div class="banner warning within-modal">{controlError}</div>
+                {/if}
+                {#if controlMessage}
+                  <div class="banner info within-modal">{controlMessage}</div>
+                {/if}
+              </div>
+            </div>
+          {/if}
+        {/if}
+
+        <div class="form-group module-purge">
+          <p class="form-label">Remove module</p>
+          <small>Forget this hardware until it reconnects. Helpful after renaming or replacing controllers.</small>
+          {#if purgeConfirming}
             <div class="reset-actions">
-              <p>This cannot be undone. Reset spool telemetry to 100%?</p>
+              <p>This removes {selectedModule?.label ?? selectedPhysicalModuleId} and clears its usage history.</p>
               <div class="button-row">
-                <button type="button" class="ghost" on:click={cancelSpoolReset} disabled={spoolResetBusy}>
+                <button type="button" class="ghost" on:click={cancelModulePurge} disabled={purgeBusy}>
                   Cancel
                 </button>
                 <button
                   type="button"
                   class="danger"
-                  on:click={confirmSpoolReset}
-                  disabled={spoolResetBusy || !selectedModuleId}
+                  on:click={confirmModulePurge}
+                  disabled={!selectedPhysicalModuleId || purgeBusy}
                 >
-                  {spoolResetBusy ? 'Resetting…' : 'Confirm reset'}
+                  {purgeBusy ? 'Purging…' : 'Confirm removal'}
                 </button>
               </div>
             </div>
@@ -2395,103 +4130,13 @@
             <button
               type="button"
               class="danger"
-              on:click={startSpoolReset}
-              disabled={!selectedModuleId || controlBusy}
+              on:click={startModulePurge}
+              disabled={!selectedPhysicalModuleId || controlBusy}
             >
-              Reset spool meter
+              Remove module
             </button>
           {/if}
         </div>
-
-        {#if calibrationModalOpen}
-          <div
-            class="calibration-modal-backdrop"
-            on:click|self={closeCalibrationModal}
-            on:keydown|self={(event) => event.key === 'Escape' && closeCalibrationModal()}
-            role="dialog"
-            aria-modal="true"
-            tabindex="0"
-          >
-            <div class="calibration-modal" role="dialog" aria-modal="true">
-              <header>
-                <div>
-                  <p class="section-label">Spool Calibration</p>
-                  <h3>Guided 10 m pull</h3>
-                </div>
-                <button type="button" class="ghost close" on:click={closeCalibrationModal}>
-                  ×
-                </button>
-              </header>
-              <div class="calibration-status-block">
-                <span
-                  class={`calibration-pill ${spoolCalibrating ? 'active' : spoolCalibrationAwaitingAck ? 'pending' : ''}`}
-                >
-                  {calibrationStatusText}
-                </span>
-                <p class="calibration-instruction">{calibrationInstruction}</p>
-                <div class="calibration-meta">
-                  <span>Sample: {formatMillimeters(spoolSampleLengthMm)}</span>
-                  <span>Roll length: {formatMillimeters(spoolLengthMm)}</span>
-                  <span>Media thickness: {formatMicrons(spoolMediaThicknessUm)}</span>
-                  {#if spoolCoreDiameterMm}
-                    <span>Core diameter: {formatMillimeters(spoolCoreDiameterMm)}</span>
-                  {/if}
-                  {#if spoolFullEdges}
-                    <span>Full-roll edges: {formatEdgeCount(spoolFullEdges)}</span>
-                  {/if}
-                  {#if spoolMmPerEdge}
-                    <span>Resolution: {formatMmPerEdge(spoolMmPerEdge)}</span>
-                  {/if}
-                  {#if spoolUsedEdges != null}
-                    <span>Edges used: {formatEdgeCount(spoolUsedEdges)}</span>
-                  {/if}
-                  {#if spoolRemainingEdges != null}
-                    <span>Edges remaining: {formatEdgeCount(spoolRemainingEdges)}</span>
-                  {/if}
-                </div>
-              </div>
-              <div class="button-row calibration-actions">
-                <button
-                  type="button"
-                  class="primary"
-                  on:click={startSpoolCalibration}
-                  disabled={
-                    !selectedModuleId || spoolCalibrationBusy || spoolCalibrating || spoolCalibrationAwaitingAck
-                  }
-                >
-                  {spoolCalibrationBusy && !spoolCalibrating ? 'Working…' : 'Request start'}
-                </button>
-                <button
-                  type="button"
-                  class="success"
-                  on:click={finishSpoolCalibration}
-                  disabled={!selectedModuleId || spoolCalibrationBusy || !spoolCalibrating}
-                >
-                  {spoolCalibrationBusy && spoolCalibrating ? 'Working…' : 'Finish & save'}
-                </button>
-                <button
-                  type="button"
-                  class="danger"
-                  on:click={cancelSpoolCalibration}
-                  disabled={
-                    !selectedModuleId || spoolCalibrationBusy || (!spoolCalibrating && !spoolCalibrationAwaitingAck)
-                  }
-                >
-                  Cancel calibration
-                </button>
-              </div>
-              <small class="calibration-note">
-                Adjust the target roll length above before finishing if the replacement roll differs.
-              </small>
-              {#if controlError}
-                <div class="banner warning within-modal">{controlError}</div>
-              {/if}
-              {#if controlMessage}
-                <div class="banner info within-modal">{controlMessage}</div>
-              {/if}
-            </div>
-          </div>
-        {/if}
 
         {#if controlError && !calibrationModalOpen}
           <div class="banner warning">{controlError}</div>
@@ -2514,7 +4159,27 @@
       <p class="modal-module">{activeAlarmModal.moduleLabel}</p>
       <p class="modal-meta">Detected {formatAlertTimestamp(activeAlarmModal.timestamp)}</p>
 
-      {#if activeAlarmModal.meta && Object.keys(activeAlarmModal.meta).length}
+      {#if isThermistorMismatchAlarm(activeAlarmModal) && activeThermistorAlarmDetails}
+        <div class="alarm-meta heater">
+          <div class="thermistor-delta">
+            <p class="meta-label">Probe delta</p>
+            <p class="meta-value">{formatCelsiusValue(activeThermistorAlarmDetails.delta)}</p>
+            {#if activeThermistorAlarmDetails.threshold != null}
+              <p class="meta-subtext">Threshold {formatCelsiusValue(activeThermistorAlarmDetails.threshold)}</p>
+            {/if}
+          </div>
+          <div class="thermistor-probes">
+            <div>
+              <p class="meta-label">Primary</p>
+              <p class="meta-value">{formatCelsiusValue(activeThermistorAlarmDetails.primary)}</p>
+            </div>
+            <div>
+              <p class="meta-label">Secondary</p>
+              <p class="meta-value">{formatCelsiusValue(activeThermistorAlarmDetails.secondary)}</p>
+            </div>
+          </div>
+        </div>
+      {:else if activeAlarmModal.meta && Object.keys(activeAlarmModal.meta).length}
         <div class="alarm-meta">
           {#each Object.entries(activeAlarmModal.meta) as [key, value]}
             <div>
