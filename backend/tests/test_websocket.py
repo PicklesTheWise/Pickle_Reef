@@ -1,12 +1,19 @@
 import asyncio
+import json
+import sqlite3
+from datetime import datetime, timedelta
 from math import isclose
 
 from fastapi.testclient import TestClient
 
 from app.main import app
+from app.core.config import settings
+from app.services.ws_trace import clear_ws_trace, record_ws_trace, get_ws_trace
 from app.services.module_status import (
+    apply_ato_activations,
     apply_spool_activations,
     record_module_alarm,
+    reset_module_store,
     upsert_module_manifest,
     upsert_module_status,
 )
@@ -39,6 +46,86 @@ def test_websocket_accepts_status_payload():
         }
         websocket.send_json(payload)
         # allow server to process without expecting another message
+
+
+def test_status_frames_always_logged_in_trace():
+    clear_ws_trace()
+    module_id = "TraceLogger"
+    with client.websocket_connect("/ws") as websocket:
+        websocket.receive_json()  # config_request
+        websocket.receive_json()  # module_manifest_request
+        websocket.send_json(_base_status_payload(module_id))
+
+    response = client.get("/api/debug/ws-trace")
+    response.raise_for_status()
+    entries = response.json()
+    assert any(
+        entry.get("payload", {}).get("type") == "status" and entry.get("payload", {}).get("module") == module_id
+        for entry in entries
+    ), "Expected status frame to be persisted in trace log"
+    clear_ws_trace()
+
+
+def test_ws_trace_retention_prunes_old_entries():
+    clear_ws_trace()
+    conn = sqlite3.connect(settings.ws_trace_db_path)
+    old_timestamp = (datetime.utcnow() - timedelta(days=settings.ws_trace_retention_days + 1)).isoformat(
+        timespec="milliseconds"
+    )
+    conn.execute(
+        "INSERT INTO ws_trace_log (recorded_at, direction, module_id, payload) VALUES (?, ?, ?, ?)",
+        (old_timestamp, "rx", "LegacyModule", json.dumps({"type": "status"})),
+    )
+    conn.commit()
+    conn.close()
+
+    record_ws_trace("rx", {"type": "status"}, "FreshModule")
+
+    entries = get_ws_trace(limit=100)
+    assert all(entry["module_id"] != "LegacyModule" for entry in entries)
+    assert any(entry["module_id"] == "FreshModule" for entry in entries)
+    clear_ws_trace()
+
+
+def test_temperature_history_endpoint_filters_window():
+    clear_ws_trace()
+
+    # Insert an old entry that should be outside the default window.
+    conn = sqlite3.connect(settings.ws_trace_db_path)
+    old_timestamp = (datetime.utcnow() - timedelta(hours=2)).isoformat(timespec="milliseconds")
+    conn.execute(
+        "INSERT INTO ws_trace_log (recorded_at, direction, module_id, payload) VALUES (?, ?, ?, ?)",
+        (old_timestamp, "rx", "HistoryOld", json.dumps(_heater_status_payload("HistoryOld"))),
+    )
+    conn.commit()
+    conn.close()
+
+    record_ws_trace("rx", _heater_status_payload("HistoryFresh"), "HistoryFresh")
+
+    response = client.get("/api/temperature/history", params={"window_minutes": 60})
+    response.raise_for_status()
+    samples = response.json()
+    module_ids = {entry["module_id"] for entry in samples}
+    assert "HistoryFresh" in module_ids
+    assert "HistoryOld" not in module_ids
+    sample = next(entry for entry in samples if entry["module_id"] == "HistoryFresh")
+    assert sample["thermistors"]
+    assert sample["timestamp"] > 0
+    assert isinstance(sample["heater_on"], bool)
+    clear_ws_trace()
+
+
+def test_temperature_history_endpoint_supports_module_filter():
+    clear_ws_trace()
+    record_ws_trace("rx", _heater_status_payload("HeaterA"), "HeaterA")
+    record_ws_trace("rx", _heater_status_payload("HeaterB"), "HeaterB")
+
+    response = client.get("/api/temperature/history", params={"module_id": "HeaterB"})
+    response.raise_for_status()
+    samples = response.json()
+    module_ids = {entry["module_id"] for entry in samples}
+    assert module_ids == {"HeaterB"}
+    clear_ws_trace()
 
 
 def test_alarm_payload_persists_in_module_record():
@@ -213,6 +300,290 @@ def test_spool_activations_uses_count_alias():
     assert spool_state.get("percent_remaining") == 97
 
 
+def test_spool_activations_record_usage_history():
+    module_id = "SpoolUsageTracker"
+    initial_status = _base_status_payload(module_id)
+    initial_status["spool"] = {
+        "full_edges": 20000,
+        "total_length_mm": 50000,
+        "used_edges": 0,
+        "percent_remaining": 100,
+    }
+    asyncio.run(upsert_module_status(initial_status))
+
+    asyncio.run(
+        apply_spool_activations(
+            {
+                "module": module_id,
+                "type": "spool_activations",
+                "activations": 10,
+                "percent_remaining": 100,
+            }
+        )
+    )
+    asyncio.run(
+        apply_spool_activations(
+            {
+                "module": module_id,
+                "type": "spool_activations",
+                "activations": 11,
+                "percent_remaining": 98,
+            }
+        )
+    )
+
+    response = client.get("/api/spool-usage?window_hours=24")
+    response.raise_for_status()
+    entries = response.json()
+    assert entries, "Expected at least one spool usage entry"
+    entry = entries[0]
+    assert entry["delta_mm"] > 0
+    assert entry["total_used_edges"] > 0
+
+
+def test_status_frame_with_envelope_populates_heater_snapshot():
+    module_id = "PickleHeat.Heater"
+    with client.websocket_connect("/ws") as websocket:
+        websocket.receive_json()
+        websocket.receive_json()
+        websocket.send_json(
+            {
+                "protocol": "reefnet.v1",
+                "module_id": module_id,
+                "type": "status",
+                "payload": {
+                    "subsystems": [
+                        {
+                            "key": "heater",
+                            "kind": "heater",
+                            "state": "heating",
+                            "sensors": [
+                                {"label": "Primary", "value": 25.2, "unit": "C"},
+                                {"label": "Secondary", "value": 25.0, "unit": "C"},
+                            ],
+                        }
+                    ]
+                },
+            }
+        )
+
+    response = client.get("/api/modules")
+    response.raise_for_status()
+    module_records = response.json()
+    target = next((entry for entry in module_records if entry["module_id"] == module_id), None)
+    assert target is not None
+    heater = target.get("status_payload", {}).get("heater")
+    assert heater is not None
+    assert heater.get("state") == "heating"
+    thermometers = heater.get("thermometers")
+    assert isinstance(thermometers, list) and len(thermometers) >= 2
+
+
+def test_upsert_status_accepts_module_id_alias():
+    reset_module_store()
+    module_id = "AliasStatus"
+    payload = _base_status_payload(module_id)
+    payload.pop("module")
+    payload["module_id"] = module_id
+    asyncio.run(upsert_module_status(payload))
+
+    response = client.get("/api/modules")
+    response.raise_for_status()
+    module_records = response.json()
+    target = next((entry for entry in module_records if entry["module_id"] == module_id), None)
+    assert target is not None
+    assert target["label"] == module_id
+
+
+def test_spool_activations_use_connection_hint_when_module_missing():
+    reset_module_store()
+    module_id = "HintedSpool"
+    asyncio.run(upsert_module_status(_base_status_payload(module_id)))
+    asyncio.run(
+        apply_spool_activations(
+            {
+                "type": "spool_activations",
+                "activations": 4,
+                "percent_remaining": 96,
+            },
+            module_hint=module_id,
+        )
+    )
+
+    response = client.get("/api/modules")
+    response.raise_for_status()
+    module_records = response.json()
+    target = next((entry for entry in module_records if entry["module_id"] == module_id), None)
+    assert target is not None
+    spool_state = target.get("spool_state")
+    assert spool_state.get("activations") == 4
+    assert spool_state.get("percent_remaining") == 96
+
+
+def test_module_snapshots_endpoint_returns_history():
+    module_id = "SnapshotLogger"
+    with client.websocket_connect("/ws") as websocket:
+        websocket.receive_json()
+        websocket.receive_json()
+        websocket.send_json(_base_status_payload(module_id))
+        updated = _base_status_payload(module_id)
+        updated["motor"]["runtime_ms"] = 5000
+        websocket.send_json(updated)
+
+    response = client.get(f"/api/modules/{module_id}/snapshots?limit=5")
+    response.raise_for_status()
+    snapshots = response.json()
+    assert len(snapshots) >= 2
+    payload = snapshots[-1]["payload"]
+    assert payload["module"] == module_id
+    assert payload["motor"]["runtime_ms"] == 5000
+
+
+def test_ato_activations_updates_reservoir_snapshot():
+    reset_module_store()
+    module_id = "PickleSump"
+    asyncio.run(upsert_module_status(_base_status_payload(module_id)))
+    asyncio.run(
+        apply_ato_activations(
+            {
+                "type": "ato_activations",
+                "activations": 12,
+                "tank_percent": 55,
+                "tank_level_ml": 8250,
+                "tank_capacity_ml": 15000,
+            },
+            module_hint=module_id,
+        )
+    )
+
+    response = client.get("/api/modules")
+    response.raise_for_status()
+    module_records = response.json()
+    target = next((entry for entry in module_records if entry["module_id"] == module_id), None)
+    assert target is not None
+    ato_state = target.get("status_payload", {}).get("ato")
+    assert ato_state is not None
+    assert ato_state.get("activations") == 12
+    assert ato_state.get("tank_percent") == 55
+    assert ato_state.get("tank_level_ml") == 8250
+
+
+def test_alarm_frame_with_envelope_records_alarm():
+    module_id = "HeaterAlarmEnvelope"
+    with client.websocket_connect("/ws") as websocket:
+        websocket.receive_json()
+        websocket.receive_json()
+        websocket.send_json(
+            {
+                "protocol": "reefnet.v1",
+                "module_id": module_id,
+                "type": "status",
+                "payload": {
+                    "module": module_id,
+                    "motor": {"state": "idle", "speed": 0},
+                },
+            }
+        )
+        websocket.send_json(
+            {
+                "protocol": "reefnet.v1",
+                "module_id": module_id,
+                "type": "alarm",
+                "payload": {
+                    "severity": "warning",
+                    "code": "thermistor_mismatch",
+                    "message": "Thermistors disagree",
+                    "active": True,
+                    "triggered_at": "2026-02-27T21:02:00Z",
+                    "meta": {"delta_c": 0.9},
+                },
+            }
+        )
+
+    response = client.get("/api/modules")
+    response.raise_for_status()
+    module_records = response.json()
+    target = next((entry for entry in module_records if entry["module_id"] == module_id), None)
+    assert target is not None
+    alarms = target.get("alarms") or []
+    assert any(alarm.get("code") == "thermistor_mismatch" for alarm in alarms)
+
+def test_alarm_frame_with_envelope_records_alarm():
+    module_id = "HeaterAlarmEnvelope"
+    with client.websocket_connect("/ws") as websocket:
+        websocket.receive_json()
+        websocket.receive_json()
+        websocket.send_json(
+            {
+                "protocol": "reefnet.v1",
+                "module_id": module_id,
+                "type": "status",
+                "payload": {
+                    "module": module_id,
+                    "motor": {"state": "idle", "speed": 0},
+                },
+            }
+        )
+        websocket.send_json(
+            {
+                "protocol": "reefnet.v1",
+                "module_id": module_id,
+                "type": "alarm",
+                "payload": {
+                    "severity": "warning",
+                    "code": "thermistor_mismatch",
+                    "message": "Thermistors disagree",
+                    "active": True,
+                    "triggered_at": "2026-02-27T21:02:00Z",
+                    "meta": {"delta_c": 0.9},
+                },
+            }
+        )
+
+    response = client.get("/api/modules")
+    response.raise_for_status()
+    module_records = response.json()
+    target = next((entry for entry in module_records if entry["module_id"] == module_id), None)
+    assert target is not None
+    alarms = target.get("alarms") or []
+    assert any(alarm.get("code") == "thermistor_mismatch" for alarm in alarms)
+
+
+def test_ato_activations_emit_cycle_logs():
+    module_id = "AtoCycleTester"
+    asyncio.run(upsert_module_status(_base_status_payload(module_id)))
+    asyncio.run(
+        apply_ato_activations(
+            {
+                "module": module_id,
+                "type": "ato_activations",
+                "activations": 5,
+                "tank_level_ml": 9000,
+            }
+        )
+    )
+    asyncio.run(
+        apply_ato_activations(
+            {
+                "module": module_id,
+                "type": "ato_activations",
+                "activations": 6,
+                "tank_level_ml": 8800,
+            }
+        )
+    )
+
+    response = client.get("/api/cycles/history?window_hours=24")
+    response.raise_for_status()
+    data = response.json()
+    assert data["ato_runs"], "Expected inferred pump cycles"
+    cycle = data["ato_runs"][0]
+    assert cycle["cycle_type"].startswith("pump")
+    assert cycle["duration_ms"] and cycle["duration_ms"] > 0
+    expected_duration = int(round((9000 - 8800) / 0.0375))
+    assert abs(cycle["duration_ms"] - expected_duration) <= 10
+
+
 def _base_status_payload(module_id: str) -> dict:
     return {
         "module": module_id,
@@ -227,6 +598,19 @@ def _base_status_payload(module_id: str) -> dict:
         },
         "system": {"chirp_enabled": True, "uptime_s": 10},
     }
+
+
+def _heater_status_payload(module_id: str) -> dict:
+    payload = _base_status_payload(module_id)
+    payload["heater"] = {
+        "setpoint_c": 78.6,
+        "output": 0.3,
+        "thermistors": [
+            {"label": "Probe 1", "value": 78.4},
+            {"label": "Probe 2", "value": 77.9},
+        ],
+    }
+    return payload
 
 
 def test_module_subsystems_fallback_to_defaults():

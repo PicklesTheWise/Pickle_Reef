@@ -14,6 +14,12 @@ SPOOL_CORE_DIAMETER_MIN_MM = 12
 SPOOL_CORE_DIAMETER_MAX_MM = 80
 TANK_CAPACITY_MIN_ML = 5_000
 TANK_CAPACITY_MAX_ML = 50_000
+HEATER_TEMP_MIN_C = 10
+HEATER_TEMP_MAX_C = 40
+HEATER_HYSTERESIS_MIN_C = 0.1
+HEATER_HYSTERESIS_MAX_C = 2.0
+PROBE_TOLERANCE_MIN_C = 0.1
+PROBE_TOLERANCE_MAX_C = 3.0
 
 
 class ModuleStatus(SQLModel, table=True):
@@ -159,17 +165,35 @@ class ModuleControlRequest(SQLModel):
         default=None,
         description="Momentary flag set after a confirmed full refill",
     )
+    heater_setpoint_c: float | None = Field(
+        default=None,
+        ge=HEATER_TEMP_MIN_C,
+        le=HEATER_TEMP_MAX_C,
+        description="Central heater target temperature (°C)",
+    )
+    heater_hysteresis_span_c: float | None = Field(
+        default=None,
+        ge=HEATER_HYSTERESIS_MIN_C,
+        le=HEATER_HYSTERESIS_MAX_C,
+        description="Total width of the heater hysteresis band (°C)",
+    )
     heater_setpoint_min_c: float | None = Field(
         default=None,
-        ge=10,
-        le=40,
+        ge=HEATER_TEMP_MIN_C,
+        le=HEATER_TEMP_MAX_C,
         description="Lower bound of the heater hysteresis band (°C)",
     )
     heater_setpoint_max_c: float | None = Field(
         default=None,
-        ge=10,
-        le=40,
+        ge=HEATER_TEMP_MIN_C,
+        le=HEATER_TEMP_MAX_C,
         description="Upper bound of the heater hysteresis band (°C)",
+    )
+    probe_tolerance_c: float | None = Field(
+        default=None,
+        ge=PROBE_TOLERANCE_MIN_C,
+        le=PROBE_TOLERANCE_MAX_C,
+        description="Allowed delta between probe readings before mismatch alarm (°C)",
     )
 
     @model_validator(mode="after")
