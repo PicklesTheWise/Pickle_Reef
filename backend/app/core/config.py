@@ -5,6 +5,8 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 BASE_DIR = Path(__file__).resolve().parent.parent
 DEFAULT_DB_PATH = BASE_DIR.parent / "data" / "pickle_reef.db"
 DEFAULT_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+DEFAULT_WS_TRACE_DB_PATH = BASE_DIR.parent / "data" / "ws_trace.db"
+DEFAULT_WS_TRACE_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 
 
 class Settings(BaseSettings):
@@ -20,6 +22,8 @@ class Settings(BaseSettings):
     mqtt_port: int = 1883
     mqtt_topic_prefix: str = "pickle-reef"
     ws_trace: bool = False
+    ws_trace_db_path: Path = DEFAULT_WS_TRACE_DB_PATH
+    ws_trace_retention_days: int = 30
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="allow")
 

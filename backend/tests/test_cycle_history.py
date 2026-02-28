@@ -5,12 +5,13 @@ from httpx import ASGITransport, AsyncClient
 
 from app.main import app
 from app.schemas.cycle import CycleLog
-from app.services.cycle_log import add_cycle_log_entry
+from app.services.cycle_log import add_cycle_log_entry, clear_cycle_logs
 
 
 @pytest.mark.asyncio
 async def test_cycle_history_endpoint_filters_and_summarizes():
-    add_cycle_log_entry(
+    await clear_cycle_logs()
+    await add_cycle_log_entry(
         CycleLog(
             module_id="reef-roller-1",
             cycle_type="roller_auto",
@@ -19,7 +20,7 @@ async def test_cycle_history_endpoint_filters_and_summarizes():
             recorded_at=datetime.utcnow() - timedelta(hours=2),
         )
     )
-    add_cycle_log_entry(
+    await add_cycle_log_entry(
         CycleLog(
             module_id="reef-roller-1",
             cycle_type="pump_normal",
@@ -28,7 +29,7 @@ async def test_cycle_history_endpoint_filters_and_summarizes():
             recorded_at=datetime.utcnow() - timedelta(hours=1),
         )
     )
-    add_cycle_log_entry(
+    await add_cycle_log_entry(
         CycleLog(
             module_id="reef-roller-1",
             cycle_type="roller_auto",
@@ -47,3 +48,25 @@ async def test_cycle_history_endpoint_filters_and_summarizes():
         assert data["ato_stats"]["count"] == 1
         assert data["roller_runs"][0]["duration_ms"] == 3200
         assert data["ato_stats"]["avg_fill_seconds"] == pytest.approx(7.8, rel=0.01)
+
+
+@pytest.mark.asyncio
+async def test_cycle_history_includes_ato_cycle_prefixes():
+    await clear_cycle_logs()
+    await add_cycle_log_entry(
+        CycleLog(
+            module_id="reef-roller-1",
+            cycle_type="ATO_fill",
+            trigger="manual_button",
+            duration_ms=6400,
+            recorded_at=datetime.utcnow() - timedelta(hours=1),
+        )
+    )
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+        response = await client.get("/api/cycles/history?window_hours=24")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["ato_stats"]["count"] == 1
+        assert data["ato_runs"][0]["cycle_type"].lower().startswith("ato")

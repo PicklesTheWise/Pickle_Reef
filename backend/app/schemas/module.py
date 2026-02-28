@@ -14,6 +14,22 @@ SPOOL_CORE_DIAMETER_MIN_MM = 12
 SPOOL_CORE_DIAMETER_MAX_MM = 80
 TANK_CAPACITY_MIN_ML = 5_000
 TANK_CAPACITY_MAX_ML = 50_000
+HEATER_TEMP_MIN_C = 10
+HEATER_TEMP_MAX_C = 40
+HEATER_HYSTERESIS_MIN_C = 0.1
+HEATER_HYSTERESIS_MAX_C = 2.0
+PROBE_TOLERANCE_MIN_C = 0.1
+PROBE_TOLERANCE_MAX_C = 3.0
+PROBE_TIMEOUT_MIN_S = 5
+PROBE_TIMEOUT_MAX_S = 300
+RUNAWAY_DELTA_MIN_C = 0.5
+RUNAWAY_DELTA_MAX_C = 10.0
+MAX_HEATER_ON_MIN_MIN = 1
+MAX_HEATER_ON_MIN_MAX = 120
+STUCK_RELAY_DELTA_MIN_C = 0.1
+STUCK_RELAY_DELTA_MAX_C = 5.0
+STUCK_RELAY_WINDOW_MIN_S = 10
+STUCK_RELAY_WINDOW_MAX_S = 600
 
 
 class ModuleStatus(SQLModel, table=True):
@@ -159,17 +175,69 @@ class ModuleControlRequest(SQLModel):
         default=None,
         description="Momentary flag set after a confirmed full refill",
     )
+    heater_setpoint_c: float | None = Field(
+        default=None,
+        ge=HEATER_TEMP_MIN_C,
+        le=HEATER_TEMP_MAX_C,
+        description="Central heater target temperature (°C)",
+    )
+    heater_hysteresis_span_c: float | None = Field(
+        default=None,
+        ge=HEATER_HYSTERESIS_MIN_C,
+        le=HEATER_HYSTERESIS_MAX_C,
+        description="Total width of the heater hysteresis band (°C)",
+    )
     heater_setpoint_min_c: float | None = Field(
         default=None,
-        ge=10,
-        le=40,
+        ge=HEATER_TEMP_MIN_C,
+        le=HEATER_TEMP_MAX_C,
         description="Lower bound of the heater hysteresis band (°C)",
     )
     heater_setpoint_max_c: float | None = Field(
         default=None,
-        ge=10,
-        le=40,
+        ge=HEATER_TEMP_MIN_C,
+        le=HEATER_TEMP_MAX_C,
         description="Upper bound of the heater hysteresis band (°C)",
+    )
+    probe_tolerance_c: float | None = Field(
+        default=None,
+        ge=PROBE_TOLERANCE_MIN_C,
+        le=PROBE_TOLERANCE_MAX_C,
+        description="Allowed delta between probe readings before mismatch alarm (°C)",
+    )
+    probe_timeout_s: int | None = Field(
+        default=None,
+        ge=PROBE_TIMEOUT_MIN_S,
+        le=PROBE_TIMEOUT_MAX_S,
+        description="Seconds before stale probe data triggers timeout safety checks",
+    )
+    runaway_delta_c: float | None = Field(
+        default=None,
+        ge=RUNAWAY_DELTA_MIN_C,
+        le=RUNAWAY_DELTA_MAX_C,
+        description="Overshoot threshold above setpoint before runaway alarm logic trips (°C)",
+    )
+    max_heater_on_min: int | None = Field(
+        default=None,
+        ge=MAX_HEATER_ON_MIN_MIN,
+        le=MAX_HEATER_ON_MIN_MAX,
+        description="Maximum continuous heater-on runtime before timeout safety triggers (minutes)",
+    )
+    stuck_relay_delta_c: float | None = Field(
+        default=None,
+        ge=STUCK_RELAY_DELTA_MIN_C,
+        le=STUCK_RELAY_DELTA_MAX_C,
+        description="Temperature rise delta used by stuck relay detection logic (°C)",
+    )
+    stuck_relay_window_s: int | None = Field(
+        default=None,
+        ge=STUCK_RELAY_WINDOW_MIN_S,
+        le=STUCK_RELAY_WINDOW_MAX_S,
+        description="Observation window for stuck relay detection (seconds)",
+    )
+    alarm_snooze: bool | None = Field(
+        default=None,
+        description="When true, request immediate alarm snooze/acknowledge behavior from module firmware",
     )
 
     @model_validator(mode="after")

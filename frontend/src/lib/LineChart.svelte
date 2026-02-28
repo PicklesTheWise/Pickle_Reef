@@ -30,6 +30,17 @@
     maintainAspectRatio: false,
     animation: false,
     interaction: { intersect: false, mode: 'index' },
+    elements: {
+      line: {
+        borderWidth: 2.5,
+        cubicInterpolationMode: 'monotone',
+      },
+      point: {
+        radius: 0,
+        hoverRadius: 3,
+        hitRadius: 10,
+      },
+    },
     scales: {
       x: {
         type: 'linear',
@@ -111,7 +122,15 @@
   $: if (chart) {
     chart.data.datasets = datasets ?? []
     const updatedOptions = buildOptions()
-    chart.options = updatedOptions
+    chart.options.animation = updatedOptions.animation
+    chart.options.interaction = updatedOptions.interaction
+    chart.options.elements = updatedOptions.elements
+    chart.options.plugins = updatedOptions.plugins
+    const yScale = chart.options.scales.y
+    yScale.beginAtZero = updatedOptions.scales.y.beginAtZero
+    yScale.min = updatedOptions.scales.y.min
+    yScale.max = updatedOptions.scales.y.max
+    yScale.suggestedMax = updatedOptions.scales.y.suggestedMax
     chart.update('none')
   }
 </script>

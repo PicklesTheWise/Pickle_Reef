@@ -8,13 +8,28 @@
     updateModuleControls,
     fetchWsTrace,
     fetchSpoolUsageHistory,
+    fetchTemperatureHistory,
+    fetchSpoolTraceHistory,
+    fetchAtoTraceHistory,
     deleteModule,
   } from './lib/api'
   import LineChart from './lib/LineChart.svelte'
   import ChartWidget from './lib/ChartWidget.svelte'
+  import {
+    buildUsageSeriesPreferLevels,
+    buildAtoUsageSeries,
+    findRecentResetTimestamp,
+    normalizeTemperatureHistorySamples,
+    alignSamplesByResolution,
+    computePaddedRange,
+    buildHeaterActivationSeries,
+    buildVerticalMarkerSegments,
+  } from './lib/chartPipeline'
 
   const DEFAULT_RUNTIME = 5000
   const DEFAULT_ROLLER_SPEED = 180
+  const ROLLER_SPEED_MIN = 50
+  const ROLLER_SPEED_MAX = 255
   const DEFAULT_PUMP_TIMEOUT_MS = 120000
   const DEFAULT_ALARM_CHIRP_INTERVAL_MS = 120000
   const DEFAULT_SPOOL_LENGTH_MM = 50000
@@ -47,6 +62,8 @@
   let controlError = ''
   let controlBusy = false
   let controlsPrefilledFor = ''
+  let controlsPrefilledStamp = ''
+  let controlPrefillSignature = ''
   let spoolResetConfirming = false
   let spoolResetBusy = false
   let calibrationModalOpen = false
@@ -77,6 +94,8 @@
   let lastAlarmKeys = new Set()
   let acknowledgedAlarmKeys = new Set()
   let activeThermistorAlarmDetails = null
+  let alarmActionBusy = false
+  let alarmActionError = ''
   let atoStats = {
     count: 0,
     frequency_per_hour: 0,
@@ -98,6 +117,8 @@
   let spoolUsageHistory = []
   let tankUsageHistory = new Map()
   let heaterTelemetryHistory = new Map()
+  let spoolLevelHistory = new Map()
+  let atoLevelHistory = new Map()
   let temperatureSeries = { datasets: [], yMin: undefined, yMax: undefined }
   let temperatureChartDatasets = []
   let temperatureYAxisMin = undefined
@@ -106,27 +127,55 @@
   let temperatureSetpointC = 25
   let heaterSetpointMinC = 24
   let heaterSetpointMaxC = 26
+  let heaterHysteresisSpanC = 0.2
+  let heaterProbeToleranceC = 0.7
+  let heaterProbeTimeoutS = 45
+  let heaterRunawayDeltaC = 2
+  let heaterMaxOnMinutes = 15
+  let heaterStuckRelayDeltaC = 0.5
+  let heaterStuckRelayWindowS = 60
+  let heaterControlSection = 'basic'
   let latestTemperatureSample = null
   let selectedHeaterSamples = []
   let heaterSamplesInWindow = []
   let isHeaterView = false
   let primaryHeaterSamples = []
   let primaryHeaterSample = null
-  let heroCurrentTempC = null
   let heroAverage3dTempC = null
+  let heroTemperatureDisplay = '—'
 
   const WS_LOG_REFRESH_MS = 3000
+  const UI_REFRESH_INTERVAL_MS = 15000
   const HOUR_IN_MS = 60 * 60 * 1000
   const USAGE_HISTORY_WINDOW_MS = 30 * 24 * HOUR_IN_MS
   const USAGE_HISTORY_WINDOW_HOURS = USAGE_HISTORY_WINDOW_MS / HOUR_IN_MS
   const TANK_USAGE_HISTORY_MS = 30 * 24 * HOUR_IN_MS
   const HEATER_HISTORY_WINDOW_MS = 72 * HOUR_IN_MS
+  const HEATER_DUTY_WINDOW_MS = HOUR_IN_MS
   const HEATER_SETPOINT_MIN_BOUND_C = 10
   const HEATER_SETPOINT_MAX_BOUND_C = 35
+  const DEFAULT_HEATER_HYSTERESIS_SPAN_C = 0.2
+  const HEATER_HYSTERESIS_MIN_C = 0.1
+  const HEATER_HYSTERESIS_MAX_C = 2
+  const DEFAULT_PROBE_TOLERANCE_C = 0.7
+  const PROBE_TOLERANCE_MIN_C = 0.1
+  const PROBE_TOLERANCE_MAX_C = 3
+  const DEFAULT_PROBE_TIMEOUT_S = 45
+  const PROBE_TIMEOUT_MIN_S = 5
+  const PROBE_TIMEOUT_MAX_S = 300
+  const DEFAULT_RUNAWAY_DELTA_C = 2
+  const RUNAWAY_DELTA_MIN_C = 0.5
+  const RUNAWAY_DELTA_MAX_C = 10
+  const DEFAULT_MAX_HEATER_ON_MIN = 15
+  const MAX_HEATER_ON_MIN_MIN = 1
+  const MAX_HEATER_ON_MIN_MAX = 120
+  const DEFAULT_STUCK_RELAY_DELTA_C = 0.5
+  const STUCK_RELAY_DELTA_MIN_C = 0.1
+  const STUCK_RELAY_DELTA_MAX_C = 5
+  const DEFAULT_STUCK_RELAY_WINDOW_S = 60
+  const STUCK_RELAY_WINDOW_MIN_S = 10
+  const STUCK_RELAY_WINDOW_MAX_S = 600
   const HERO_AVERAGE_WINDOW_MS = 72 * HOUR_IN_MS
-  const TANK_RESET_STORAGE_KEY = 'pickle-reef::tank-reset-epoch'
-  const SPOOL_USAGE_STORAGE_KEY = 'pickle-reef::spool-usage-history'
-  const SPOOL_RESET_STORAGE_KEY = 'pickle-reef::spool-reset-epoch'
   const usageWindowPresets = [
     { hours: 1, label: '1h', description: 'Rolling last hour' },
     { hours: 6, label: '6h', description: 'Rolling last 6 hours' },
@@ -160,15 +209,74 @@
   let temperatureChartWindowHours = defaultTemperaturePreset?.hours ?? 6
   let temperatureChartWindowMs = temperatureChartWindowHours * HOUR_IN_MS
   const SPOOL_RESET_EDGE_THRESHOLD = 10
-  const spoolSnapshots = new Map()
-  const spoolResetTimestamps = new Map()
-  let spoolResetVersion = 0
-  const tankResetTimestamps = new Map()
+  const CHART_FOCUS_TARGETS = {
+    temperature: 'chart-temperature',
+    ato: 'chart-ato',
+    filter: 'chart-filter',
+  }
+  const CHART_FOCUS_KEY_TO_ID = CHART_FOCUS_TARGETS
+  const CHART_FOCUS_IDS = new Set(Object.values(CHART_FOCUS_TARGETS))
+
+  let isCompactEmbed = false
+  let compactEmbedTargetId = CHART_FOCUS_TARGETS.temperature
+
+  const updateCompactEmbedStateFromLocation = () => {
+    if (typeof window === 'undefined') return
+    const params = new URLSearchParams(window.location.search)
+    const isIframeContext = (() => {
+      try {
+        return window.self !== window.top
+      } catch {
+        return true
+      }
+    })()
+    isCompactEmbed = params.get('embed') === 'compact' || isIframeContext
+    const chartParam = (params.get('chart') ?? '').toString().trim().toLowerCase()
+    const hashTarget = decodeURIComponent(window.location.hash.replace(/^#/, '').trim())
+    const paramTarget = CHART_FOCUS_KEY_TO_ID[chartParam]
+    if (isCompactEmbed) {
+      compactEmbedTargetId = paramTarget ?? CHART_FOCUS_TARGETS.temperature
+      return
+    }
+    compactEmbedTargetId = paramTarget
+      ? paramTarget
+      : CHART_FOCUS_IDS.has(hashTarget)
+        ? hashTarget
+        : CHART_FOCUS_TARGETS.temperature
+  }
+
+  const shouldRenderChartInView = (targetId) => {
+    if (!isCompactEmbed) return true
+    return compactEmbedTargetId === targetId
+  }
+
+  const focusChartByKey = (key) => {
+    if (typeof document === 'undefined') return
+    const targetId = CHART_FOCUS_TARGETS[key]
+    if (!targetId) return
+    const anchor = document.getElementById(targetId)
+    if (!anchor) return
+    anchor.scrollIntoView({ behavior: 'smooth', block: 'start', inline: 'nearest' })
+    anchor.classList.add('chart-focus-ring')
+    const clearFocus = () => anchor.classList.remove('chart-focus-ring')
+    if (typeof window !== 'undefined' && typeof window.setTimeout === 'function') {
+      window.setTimeout(clearFocus, 1400)
+    } else {
+      setTimeout(clearFocus, 1400)
+    }
+  }
+
+  const handleExternalDashboardMessage = (event) => {
+    if (!event?.data || event.data.source !== 'pickle-touch') return
+    if (event.data.type === 'focus-chart') {
+      focusChartByKey(event.data.chart)
+    }
+  }
 
   const hiddenModuleIds = new Set(['spoolticktester', 'alarmtester'])
   const hiddenModuleIdsLower = new Set([...hiddenModuleIds].map((id) => id.toLowerCase()))
   const DEFAULT_OFFICIAL_MODULE_IDS = []
-    const PRIMARY_HEATER_MODULE_ID = 'pickleheat'
+  const PRIMARY_HEATER_MODULE_ID = 'pickleheat'
 
   const parseModuleIdList = (raw) => {
     if (typeof raw !== 'string') return []
@@ -179,6 +287,20 @@
   }
 
   const normalizeModuleId = (value) => (typeof value === 'string' ? value.trim().toLowerCase() : '')
+
+  const moduleIdMatches = (candidate, target) => {
+    if (!candidate || !target) return false
+    return normalizeModuleId(candidate) === normalizeModuleId(target)
+  }
+
+  const matchesPrimaryHeaterModule = (candidate) => {
+    const target = normalizeModuleId(PRIMARY_HEATER_MODULE_ID)
+    const normalizedCandidate = normalizeModuleId(candidate)
+    if (!target || !normalizedCandidate) return false
+    if (normalizedCandidate === target) return true
+    const separators = ['.', '-', '_']
+    return separators.some((separator) => normalizedCandidate.startsWith(`${target}${separator}`))
+  }
 
   const resolveOfficialModuleIds = () => {
     const envValue = import.meta.env?.VITE_OFFICIAL_MODULE_IDS
@@ -206,120 +328,6 @@
   }
 
   const filterDisplayableModules = (list = []) => (list ?? []).filter((module) => shouldDisplayModule(module))
-  const resolveStorage = () => {
-    if (typeof window === 'undefined') return null
-    try {
-      return window.localStorage ?? null
-    } catch (err) {
-      console.warn('Local storage unavailable', err)
-      return null
-    }
-  }
-
-  const sanitizeSpoolEntry = (entry) => {
-    if (!entry || typeof entry !== 'object') return null
-    const moduleId = entry.moduleId ?? entry.module_id
-    const timestamp =
-      typeof entry.timestamp === 'number'
-        ? entry.timestamp
-        : new Date(entry.timestamp).getTime()
-    if (!moduleId || !Number.isFinite(timestamp)) return null
-    return {
-      moduleId,
-      timestamp,
-      deltaEdges: typeof entry.deltaEdges === 'number' ? entry.deltaEdges : entry.delta_edges ?? 0,
-      deltaMm: typeof entry.deltaMm === 'number' ? entry.deltaMm : entry.delta_mm ?? 0,
-      totalUsedEdges:
-        typeof entry.totalUsedEdges === 'number'
-          ? entry.totalUsedEdges
-          : entry.total_used_edges ?? null,
-    }
-  }
-
-  function hydrateStoredSpoolUsageHistory() {
-    const storage = resolveStorage()
-    if (!storage) return []
-    try {
-      const raw = storage.getItem(SPOOL_USAGE_STORAGE_KEY)
-      if (!raw) return []
-      const parsed = JSON.parse(raw)
-      if (!Array.isArray(parsed)) return []
-      const cutoff = Date.now() - USAGE_HISTORY_WINDOW_MS
-      return parsed
-        .map(sanitizeSpoolEntry)
-        .filter((entry) => entry && entry.timestamp >= cutoff)
-    } catch (err) {
-      console.warn('Unable to hydrate spool usage history', err)
-      return []
-    }
-  }
-
-  function persistSpoolUsageHistory(history = []) {
-    const storage = resolveStorage()
-    if (!storage) return
-    try {
-      const cutoff = Date.now() - USAGE_HISTORY_WINDOW_MS
-      const payload = history
-        .map(sanitizeSpoolEntry)
-        .filter((entry) => entry && entry.timestamp >= cutoff)
-      storage.setItem(SPOOL_USAGE_STORAGE_KEY, JSON.stringify(payload))
-    } catch (err) {
-      console.warn('Unable to persist spool usage history', err)
-    }
-  }
-
-  const bumpSpoolResetVersion = () => {
-    spoolResetVersion += 1
-  }
-
-  function hydrateStoredSpoolResetTimestamps() {
-    const storage = resolveStorage()
-    if (!storage) return new Map()
-    try {
-      const raw = storage.getItem(SPOOL_RESET_STORAGE_KEY)
-      if (!raw) return new Map()
-      const parsed = JSON.parse(raw)
-      if (!parsed || typeof parsed !== 'object') return new Map()
-      const entries = Object.entries(parsed).filter((entry) => {
-        const [moduleId, timestamp] = entry
-        return typeof moduleId === 'string' && typeof timestamp === 'number' && timestamp > 0
-      })
-      return new Map(entries)
-    } catch (err) {
-      console.warn('Unable to hydrate spool reset timestamps', err)
-      return new Map()
-    }
-  }
-
-  function persistSpoolResetTimestamps() {
-    const storage = resolveStorage()
-    if (!storage) return
-    try {
-      const now = Date.now()
-      const cutoff = now - USAGE_HISTORY_WINDOW_MS
-      const payload = {}
-      spoolResetTimestamps.forEach((timestamp, moduleId) => {
-        if (typeof timestamp === 'number' && timestamp > cutoff) {
-          payload[moduleId] = timestamp
-        }
-      })
-      storage.setItem(SPOOL_RESET_STORAGE_KEY, JSON.stringify(payload))
-    } catch (err) {
-      console.warn('Unable to persist spool reset timestamps', err)
-    }
-  }
-
-  const getModuleResetBaseline = (moduleId) => {
-    const ts = spoolResetTimestamps.get(moduleId)
-    return typeof ts === 'number' ? ts : 0
-  }
-
-  function markSpoolReset(moduleId, timestamp = Date.now()) {
-    if (!moduleId) return
-    spoolResetTimestamps.set(moduleId, timestamp)
-    bumpSpoolResetVersion()
-    persistSpoolResetTimestamps()
-  }
 
   const fallbackTelemetry = [
     {
@@ -486,27 +494,178 @@
   const SUBSYSTEM_TEMPLATES = {
     roller: { suffix: 'Roller', badge: 'Filter' },
     ato: { suffix: 'ATO', badge: 'ATO' },
+    heater: { suffix: 'Heater', badge: 'Heater' },
   }
 
-  const FALLBACK_SUBSYSTEMS = Object.entries(SUBSYSTEM_TEMPLATES).map(([kind, meta]) => ({
-    key: kind,
-    kind,
-    card_suffix: meta.suffix,
-    badge_label: meta.badge,
-  }))
+  const buildTemplateDefinition = (kind) => {
+    const meta = SUBSYSTEM_TEMPLATES[kind] ?? {}
+    return {
+      key: kind,
+      kind,
+      card_suffix: meta.suffix,
+      badge_label: meta.badge,
+    }
+  }
+
+  const FALLBACK_SUBSYSTEM_KEYS = ['roller', 'ato']
+  const FALLBACK_SUBSYSTEMS = FALLBACK_SUBSYSTEM_KEYS.map((kind) => buildTemplateDefinition(kind))
 
   const normalizeSubsystemKind = (value) => {
     if (typeof value !== 'string') return ''
     return value.split(':')[0].toLowerCase()
   }
 
-  const resolveModuleSubsystems = (module) => {
-    if (Array.isArray(module?.subsystems) && module.subsystems.length) {
-      return module.subsystems
-        .map((entry) => (typeof entry === 'string' ? { key: entry } : entry))
-        .filter((entry) => entry && typeof entry === 'object')
+  const normalizeSubsystemEntries = (subsystems) => {
+    if (!Array.isArray(subsystems)) return []
+    return subsystems
+      .map((entry) => (typeof entry === 'string' ? { key: entry } : entry))
+      .filter((entry) => entry && typeof entry === 'object')
+  }
+
+  const listDeclaresHeater = (definitions) =>
+    definitions.some((entry) => normalizeSubsystemKind(entry.kind ?? entry.key ?? '') === 'heater')
+
+  const moduleHasSpoolSignals = (module = {}) => {
+    if (!module || moduleLooksLikeHeater(module)) {
+      return false
     }
-    return FALLBACK_SUBSYSTEMS
+    const statusPayload = module?.status_payload ?? module?.statusPayload ?? {}
+    const configPayload = module?.config_payload ?? module?.configPayload ?? {}
+    const sources = [module, statusPayload, configPayload]
+    return sources.some((source) => source && typeof source === 'object' && source.spool)
+  }
+
+  const moduleHasAtoSignals = (module = {}) => {
+    const statusPayload = module?.status_payload ?? module?.statusPayload ?? {}
+    const configPayload = module?.config_payload ?? module?.configPayload ?? {}
+    const sources = [module, statusPayload, configPayload]
+    if (sources.some((source) => source && typeof source === 'object' && source.ato)) {
+      return true
+    }
+    const floats = statusPayload?.floats
+    if (floats && typeof floats === 'object') {
+      return Object.values(floats).some((value) => value !== undefined)
+    }
+    return false
+  }
+
+  const moduleLooksLikeHeater = (module = {}) => {
+    const moduleType = (module?.module_type ?? module?.moduleType ?? '').toLowerCase()
+    if (moduleType.includes('heater')) {
+      return true
+    }
+    const moduleId = (module?.module_id ?? '').toLowerCase()
+    if (moduleId.includes('heater') || moduleId.includes('heat')) {
+      return true
+    }
+    const label = (module?.label ?? '').toLowerCase()
+    if (label.includes('heater') || label.includes('heat')) {
+      return true
+    }
+    const declared = normalizeSubsystemEntries(module?.subsystems)
+    if (listDeclaresHeater(declared)) {
+      return true
+    }
+    const statusPayload = module?.status_payload ?? module?.statusPayload ?? {}
+    if (statusPayload.heater || (Array.isArray(statusPayload.heaters) && statusPayload.heaters.length)) {
+      return true
+    }
+    if (listDeclaresHeater(normalizeSubsystemEntries(statusPayload.subsystems))) {
+      return true
+    }
+    const configPayload = module?.config_payload ?? module?.configPayload ?? {}
+    if (listDeclaresHeater(normalizeSubsystemEntries(configPayload.subsystems))) {
+      return true
+    }
+    return false
+  }
+
+  const guessSubsystemFromLabel = (module, tokens = []) => {
+    const label = `${module?.label ?? ''} ${module?.module_id ?? ''}`.toLowerCase()
+    return tokens.some((token) => label.includes(token))
+  }
+
+  const buildInferredSubsystems = (module) => {
+    const inferred = []
+    if (moduleHasSpoolSignals(module) || guessSubsystemFromLabel(module, ['roller', 'filter', 'spool'])) {
+      inferred.push(buildTemplateDefinition('roller'))
+    }
+    if (moduleHasAtoSignals(module) || guessSubsystemFromLabel(module, ['ato', 'pump', 'reservoir'])) {
+      inferred.push(buildTemplateDefinition('ato'))
+    }
+    if (moduleLooksLikeHeater(module)) {
+      inferred.push(buildTemplateDefinition('heater'))
+    }
+    return inferred.length ? inferred : [buildTemplateDefinition('roller')]
+  }
+
+  const moduleSupportsSubsystemKind = (module, kind) => {
+    const normalized = normalizeSubsystemKind(kind)
+    if (normalized === 'heater') {
+      return moduleLooksLikeHeater(module)
+    }
+    if (normalized === 'ato') {
+      return moduleHasAtoSignals(module)
+    }
+    if (normalized === 'roller') {
+      return moduleHasSpoolSignals(module)
+    }
+    return true
+  }
+
+  const resolveFixedSubsystems = (module) => {
+    const normalizedId = normalizeModuleId(module?.module_id ?? module?.moduleId ?? '')
+    if (!normalizedId) return null
+    if (normalizedId.startsWith('pickleheat')) {
+      return [buildTemplateDefinition('heater')]
+    }
+    return null
+  }
+
+  const resolveModuleSubsystems = (module) => {
+    const fixed = resolveFixedSubsystems(module)
+    if (fixed && fixed.length) {
+      return fixed
+    }
+    const declared = normalizeSubsystemEntries(module?.subsystems)
+    if (declared.length) {
+      return declared
+    }
+    const statusDerived = normalizeSubsystemEntries(module?.status_payload?.subsystems ?? module?.statusPayload?.subsystems)
+    if (statusDerived.length) {
+      return statusDerived
+    }
+    const configDerived = normalizeSubsystemEntries(module?.config_payload?.subsystems ?? module?.configPayload?.subsystems)
+    if (configDerived.length) {
+      return configDerived
+    }
+    return buildInferredSubsystems(module)
+  }
+
+  const listModuleSubsystemKinds = (module) => {
+    if (!module) return []
+    const definitions = resolveModuleSubsystems(module)
+    const kinds = definitions
+      .map((definition) => normalizeSubsystemKind(definition.kind ?? definition.key ?? ''))
+      .filter((kind) => kind && moduleSupportsSubsystemKind(module, kind))
+    return [...new Set(kinds)]
+  }
+
+  const pickPreferredSubsystem = (card, module) => {
+    const candidate = getCardSubsystem(card)
+    if (candidate && moduleSupportsSubsystemKind(module, candidate)) {
+      return candidate
+    }
+    if (module) {
+      const supported = listModuleSubsystemKinds(module)
+      if (supported.length) {
+        return supported[0]
+      }
+      if (moduleLooksLikeHeater(module)) return 'heater'
+      if (moduleHasAtoSignals(module)) return 'ato'
+      if (moduleHasSpoolSignals(module)) return 'roller'
+    }
+    return 'roller'
   }
 
   const buildSubsystemMeta = (baseLabel, definition = {}, index = 0) => {
@@ -526,16 +685,42 @@
     }
   }
 
+  const deriveModuleSubtitle = (label, fallback) => {
+    const source = typeof label === 'string' && label.trim().length ? label.trim() : fallback ?? ''
+    if (!source) return ''
+    const [primary] = source.split('.')
+    return primary || source
+  }
+
+  const stripTrailingSuffix = (label, suffix) => {
+    if (!label || !suffix) return label
+    const normalizedLabel = label.trim()
+    const normalizedSuffix = suffix.trim()
+    if (!normalizedLabel || !normalizedSuffix) return normalizedLabel
+    if (normalizedLabel.toLowerCase().endsWith(normalizedSuffix.toLowerCase())) {
+      const shortened = normalizedLabel.slice(0, -normalizedSuffix.length).replace(/[._-]+$/, '').trim()
+      if (shortened.length) {
+        return shortened
+      }
+    }
+    return normalizedLabel
+  }
+
   const createSubsystemCards = (module) => {
     if (!module?.module_id) return []
     const baseLabel = module.label ?? module.module_id
     const definitions = resolveModuleSubsystems(module)
-    return definitions.map((definition, index) => {
+    const cards = definitions.map((definition, index) => {
       const meta = buildSubsystemMeta(baseLabel, definition, index)
       const cardId = definition.card_id ?? `${module.module_id}::${meta.key}`
+      const rawSubtitle = deriveModuleSubtitle(baseLabel, module.module_id)
+      const subtitle = stripTrailingSuffix(rawSubtitle, meta.cardSuffix) || baseLabel
+      const cardTitle = definition.card_title ?? meta.cardSuffix ?? meta.badgeLabel ?? subtitle
       return {
         ...module,
-        label: meta.label,
+        label: baseLabel,
+        card_title: cardTitle,
+        card_subtitle: subtitle,
         badge_label: meta.badgeLabel,
         badge_variant: meta.badgeVariant,
         subsystem: meta.kind,
@@ -544,6 +729,8 @@
         subsystem_meta: { ...definition, card_suffix: meta.cardSuffix, kind: meta.kind, key: meta.key },
       }
     })
+    const filteredCards = cards.filter((card) => moduleSupportsSubsystemKind(module, card.subsystem))
+    return filteredCards.length ? filteredCards : cards
   }
 
   const getCardModuleId = (card) => card?.module_id ?? card?.moduleId ?? ''
@@ -580,101 +767,7 @@
     }
   }
 
-  function hydrateStoredTankResetTimestamps() {
-    const storage = resolveStorage()
-    if (!storage) return new Map()
-    try {
-      const raw = storage.getItem(TANK_RESET_STORAGE_KEY)
-      if (!raw) return new Map()
-      const parsed = JSON.parse(raw)
-      if (!parsed || typeof parsed !== 'object') return new Map()
-      const entries = Object.entries(parsed).filter(([moduleId, timestamp]) => {
-        return typeof moduleId === 'string' && typeof timestamp === 'number' && timestamp > 0
-      })
-      return new Map(entries)
-    } catch (err) {
-      console.warn('Unable to hydrate tank reset timestamps', err)
-      return new Map()
-    }
-  }
 
-  function persistTankResetTimestamps() {
-    const storage = resolveStorage()
-    if (!storage) return
-    try {
-      const cutoff = Date.now() - TANK_USAGE_HISTORY_MS
-      const payload = {}
-      tankResetTimestamps.forEach((timestamp, moduleId) => {
-        if (typeof timestamp === 'number' && timestamp > cutoff) {
-          payload[moduleId] = timestamp
-        }
-      })
-      storage.setItem(TANK_RESET_STORAGE_KEY, JSON.stringify(payload))
-    } catch (err) {
-      console.warn('Unable to persist tank reset timestamps', err)
-    }
-  }
-
-  function markTankReset(moduleId, timestamp = Date.now()) {
-    if (!moduleId) return
-    tankResetTimestamps.set(moduleId, timestamp)
-    persistTankResetTimestamps()
-  }
-
-  function handleSpoolReset(moduleId, timestamp = Date.now()) {
-    if (!moduleId) return
-    const hadHistory = spoolUsageHistory.some((entry) => entry.moduleId === moduleId)
-    spoolSnapshots.delete(moduleId)
-    if (hadHistory) {
-      spoolUsageHistory = spoolUsageHistory.filter((entry) => entry.moduleId !== moduleId)
-      persistSpoolUsageHistory(spoolUsageHistory)
-    }
-    markSpoolReset(moduleId, timestamp)
-  }
-
-  const normalizeSpoolTelemetry = (module) => {
-    if (!module?.module_id) return null
-    const spool =
-      module.spool_state ??
-      module.status_payload?.spool ??
-      module.statusPayload?.spool ??
-      module.spool ??
-      {}
-    const fullEdges = coalesceNumber(spool.full_edges)
-    if (!fullEdges || fullEdges <= 0) return null
-    const totalLength = coalesceNumber(spool.total_length_mm, spool.length_mm) ?? DEFAULT_SPOOL_LENGTH_MM
-    if (!totalLength || totalLength <= 0) return null
-    const mmPerEdge = totalLength / fullEdges
-    const usedEdges = coalesceNumber(spool.used_edges)
-    const remainingEdges = coalesceNumber(spool.remaining_edges)
-    const normalizedUsedEdges =
-      typeof usedEdges === 'number'
-        ? usedEdges
-        : typeof remainingEdges === 'number'
-          ? Math.max(0, fullEdges - remainingEdges)
-          : null
-    if (normalizedUsedEdges == null) return null
-    return { moduleId: module.module_id, normalizedUsedEdges, mmPerEdge }
-  }
-
-  function detectSpoolResets(moduleList = []) {
-    const now = Date.now()
-    moduleList.forEach((module) => {
-      const snapshot = normalizeSpoolTelemetry(module)
-      if (!snapshot) return
-      const previous = spoolSnapshots.get(snapshot.moduleId)
-      if (previous) {
-        const drop = previous.usedEdges - snapshot.normalizedUsedEdges
-        if (drop > SPOOL_RESET_EDGE_THRESHOLD) {
-          handleSpoolReset(snapshot.moduleId, now)
-        }
-      }
-      spoolSnapshots.set(snapshot.moduleId, {
-        usedEdges: snapshot.normalizedUsedEdges,
-        timestamp: now,
-      })
-    })
-  }
 
   const convertToCelsius = (value, unit = '°C') => {
     if (typeof value !== 'number' || Number.isNaN(value)) return null
@@ -710,6 +803,22 @@
       .filter((entry) => entry)
   }
 
+  const downsampleByTimestamp = (entries = [], intervalMs = UI_REFRESH_INTERVAL_MS) => {
+    if (!Array.isArray(entries) || entries.length <= 2) return entries
+    const sampled = []
+    let lastKeptTimestamp = null
+    entries.forEach((entry, index) => {
+      const timestamp = Number(entry?.timestamp)
+      if (!Number.isFinite(timestamp)) return
+      const isLast = index === entries.length - 1
+      if (lastKeptTimestamp == null || timestamp - lastKeptTimestamp >= intervalMs || isLast) {
+        sampled.push(entry)
+        lastKeptTimestamp = timestamp
+      }
+    })
+    return sampled
+  }
+
   const recordHeaterTelemetrySnapshot = (moduleList = []) => {
     if (!Array.isArray(moduleList) || moduleList.length === 0) return
     const now = Date.now()
@@ -741,87 +850,66 @@
     { border: 'rgba(160, 236, 174, 0.9)', background: 'rgba(160, 236, 174, 0.18)' },
   ]
 
-  const buildTemperatureSeries = (samples = [], setpointTarget = null, setpointMin = null, setpointMax = null) => {
+  const buildTemperatureSeries = (samples = []) => {
     if (!samples.length) {
       return { datasets: [], yMin: undefined, yMax: undefined }
     }
 
-    const seriesMap = new Map()
+    const probeSeries = [
+      { label: 'Temp 1', points: [] },
+      { label: 'Temp 2', points: [] },
+    ]
     const values = []
-    const toFiniteNumber = (value) => {
-      if (value == null) return null
-      const numeric = typeof value === 'number' ? value : Number(value)
-      return Number.isFinite(numeric) ? numeric : null
-    }
-    const finiteSetpoint = toFiniteNumber(setpointTarget)
-    const finiteSetpointMin = toFiniteNumber(setpointMin)
-    const finiteSetpointMax = toFiniteNumber(setpointMax)
 
     samples.forEach((sample) => {
-      sample.thermometers.forEach((reading, index) => {
+      probeSeries.forEach((bucket, index) => {
+        const reading = sample?.thermometers?.[index]
+        if (!reading) return
         if (typeof reading.value !== 'number' || Number.isNaN(reading.value)) return
         values.push(reading.value)
-        const existing = seriesMap.get(reading.key)
-        const bucket =
-          existing ?? {
-            label: reading.label ?? `Thermometer ${index + 1}`,
-            points: [],
-          }
         bucket.points.push({ x: sample.timestamp, y: reading.value })
-        seriesMap.set(reading.key, bucket)
       })
     })
-
-    if (finiteSetpoint != null) {
-      values.push(finiteSetpoint)
-    }
-    if (finiteSetpointMin != null) {
-      values.push(finiteSetpointMin)
-    }
-    if (finiteSetpointMax != null) {
-      values.push(finiteSetpointMax)
-    }
 
       if (!values.length) {
         return { datasets: [], yMin: undefined, yMax: undefined }
       }
 
-      const minValue = Math.min(...values)
-      const maxValue = Math.max(...values)
-      const padding = Math.max(0.5, (maxValue - minValue) * 0.15 || 0.8)
-      const yMin = minValue - padding
-      const yMax = maxValue + padding
+      const range = computePaddedRange(values, {
+        minPadding: 0.5,
+        fallbackPadding: 0.8,
+        paddingRatio: 0.15,
+      })
+      const yMin = range.min
+      const yMax = range.max
+      const padding = range.padding
 
-      const datasets = Array.from(seriesMap.values()).map((entry, index) => {
+      /** @type {any[]} */
+      const datasets = []
+      probeSeries.filter((entry) => entry.points.length).forEach((entry, index) => {
         const palette = THERMOMETER_COLORS[index % THERMOMETER_COLORS.length]
-        return {
+        datasets.push({
           label: entry.label,
           data: entry.points,
           borderColor: palette.border,
           backgroundColor: palette.background,
-          borderWidth: 2,
+          borderWidth: 2.6,
           fill: false,
-          tension: 0.3,
-          pointRadius: 2,
-          pointHoverRadius: 4,
+          tension: 0.35,
+          pointRadius: 0,
+          pointHoverRadius: 2,
           spanGaps: true,
-        }
+        })
       })
 
-      const heaterHigh = yMax - padding * 0.2
-      const heaterLow = yMin + padding * 0.2
-      const heaterSeries = samples.map((sample) => ({
-        x: sample.timestamp,
-        y: sample.heaterState ? heaterHigh : heaterLow,
-        heaterOn: sample.heaterState,
-      }))
+      const heaterSeries = buildHeaterActivationSeries(samples, range, { insetRatio: 0.2 })
       if (heaterSeries.length) {
         datasets.push({
-          label: 'Heater state',
+          label: 'Activation',
           data: heaterSeries,
           borderColor: 'rgba(246, 195, 67, 0.95)',
           backgroundColor: 'rgba(246, 195, 67, 0.15)',
-          borderWidth: 2,
+          borderWidth: 2.3,
           fill: false,
           stepped: true,
           pointRadius: 0,
@@ -829,37 +917,6 @@
           tension: 0,
         })
       }
-
-      const pushSetpointDataset = (label, value, options = {}) => {
-        if (value == null) return
-        datasets.push({
-          label,
-          data: samples.map((sample) => ({
-            x: sample.timestamp,
-            y: value,
-          })),
-          borderColor: options.borderColor ?? 'rgba(255, 255, 255, 0.65)',
-          borderWidth: options.borderWidth ?? 2,
-          borderDash: options.borderDash ?? [6, 4],
-          fill: options.fill ?? false,
-          pointRadius: 0,
-          pointHoverRadius: 0,
-          tension: 0,
-        })
-      }
-
-      pushSetpointDataset('Setpoint', finiteSetpoint, {
-        borderColor: 'rgba(255, 255, 255, 0.75)',
-        borderDash: [6, 4],
-      })
-      pushSetpointDataset('Setpoint min', finiteSetpointMin, {
-        borderColor: 'rgba(250, 153, 114, 0.85)',
-        borderDash: [4, 6],
-      })
-      pushSetpointDataset('Setpoint max', finiteSetpointMax, {
-        borderColor: 'rgba(119, 215, 255, 0.85)',
-        borderDash: [8, 4],
-      })
 
       return { datasets, yMin, yMax }
     }
@@ -939,12 +996,6 @@
     return numeric * FLOW_ML_PER_MS
   }
 
-  const isAtoResetEvent = (run = {}) => {
-    const type = (run.cycle_type ?? '').toString().toLowerCase()
-    const trigger = (run.trigger ?? '').toString().toLowerCase()
-    return type.includes('reset') || trigger.includes('refill') || trigger.includes('reset')
-  }
-
   
 
   
@@ -985,7 +1036,6 @@
     const date = new Date(timestamp)
     return Number.isNaN(date.getTime()) ? '—' : date.toLocaleString()
   }
-  const getUsageWindowStart = () => Math.max(Date.now() - usageChartWindowMs, moduleSpoolBaselineMs || 0)
 
   const formatCycleDuration = (ms) => {
     if (!ms && ms !== 0) return '—'
@@ -1001,13 +1051,8 @@
   }
 
   const buildActivationDatasets = (markers, maxValue, options = {}) => {
-    if (!markers?.length || !maxValue) return []
-    const data = []
-    markers.forEach((marker) => {
-      data.push({ x: marker.ts, y: 0 })
-      data.push({ x: marker.ts, y: maxValue })
-      data.push({ x: null, y: null })
-    })
+    const data = buildVerticalMarkerSegments(markers, maxValue)
+    if (!data.length) return []
     return [
       {
         label: options.label ?? 'Roller activations',
@@ -1025,6 +1070,10 @@
       },
     ]
   }
+
+  const hasRenderableChartData = (datasets = []) =>
+    Array.isArray(datasets) &&
+    datasets.some((dataset) => Array.isArray(dataset?.data) && dataset.data.some((point) => point && point.x != null && point.y != null))
 
   const usageTooltipFormatter = (context) => {
     const raw = context.raw ?? {}
@@ -1046,7 +1095,7 @@
     const raw = context.raw ?? {}
     const datasetLabel = context.dataset?.label ?? 'Temperature'
     const timeValue = raw.x ?? context.parsed?.x
-    if (datasetLabel === 'Heater state') {
+    if (datasetLabel === 'Activation') {
       const heaterOn = raw.heaterOn ?? (typeof context.parsed?.y === 'number' ? context.parsed.y > 0 : false)
       if (timeValue === undefined) return ''
       return `${datasetLabel}: ${heaterOn ? 'On' : 'Off'} • ${formatCycleTimestamp(timeValue)}`
@@ -1054,51 +1103,6 @@
     const value = typeof raw.y === 'number' ? raw.y : context.parsed?.y
     if (value === undefined || timeValue === undefined) return ''
     return `${datasetLabel}: ${formatCelsiusValue(value)} • ${formatCycleTimestamp(timeValue)}`
-  }
-
-  const buildAtoVolumePoints = (runs) => {
-    if (!runs?.length) return []
-    const sortedRuns = [...runs].sort(
-      (a, b) => new Date(a.recorded_at).getTime() - new Date(b.recorded_at).getTime()
-    )
-    let cumulative = 0
-    return sortedRuns.map((run) => {
-      const ts = new Date(run.recorded_at).getTime()
-      const duration = Math.max(0, run.duration_ms ?? 0)
-      const volume = runtimeMsToMilliliters(duration)
-      const resetEvent = isAtoResetEvent(run)
-      if (resetEvent) {
-        cumulative = 0
-      }
-      cumulative += volume
-      return {
-        ts,
-        duration,
-        volume,
-        cumulative,
-        timestamp: run.recorded_at,
-        reset: resetEvent,
-      }
-    })
-  }
-
-  const findRecentTankResetTimestamp = (samples = []) => {
-    if (!samples?.length) return null
-    let previous = null
-    for (let idx = samples.length - 1; idx >= 0; idx -= 1) {
-      const sample = samples[idx]
-      if (!sample) continue
-      const used = sample.usedMl
-      if (typeof used !== 'number') continue
-      if (used <= TANK_RESET_THRESHOLD_ML) {
-        return sample.timestamp
-      }
-      if (previous != null && used + TANK_RESET_THRESHOLD_ML < previous) {
-        return sample.timestamp
-      }
-      previous = used
-    }
-    return null
   }
 
   const deriveSummary = (dataset) => {
@@ -1129,8 +1133,9 @@
       summary = summaryResponse
       const filteredModules = filterDisplayableModules(moduleResponse)
       modules = filteredModules
-      detectSpoolResets(filteredModules)
-      await loadSpoolUsageHistory(filteredModules)
+      await loadSpoolUsageHistory()
+      await loadTemperatureHistory()
+      await loadLogHistoryBackfill(USAGE_HISTORY_WINDOW_HOURS)
       recordTankUsageSnapshot(filteredModules)
       recordHeaterTelemetrySnapshot(filteredModules)
       error = ''
@@ -1179,40 +1184,28 @@
   }
 
   onMount(() => {
-    spoolUsageHistory = hydrateStoredSpoolUsageHistory()
-    if (spoolUsageHistory.length) {
-      persistSpoolUsageHistory(spoolUsageHistory)
-    }
-    const storedResets = hydrateStoredSpoolResetTimestamps()
-    spoolResetTimestamps.clear()
-    storedResets.forEach((timestamp, moduleId) => {
-      if (typeof timestamp === 'number' && moduleId) {
-        spoolResetTimestamps.set(moduleId, timestamp)
-      }
-    })
-    if (storedResets.size) {
-      bumpSpoolResetVersion()
-    }
-    const storedTankResets = hydrateStoredTankResetTimestamps()
-    tankResetTimestamps.clear()
-    storedTankResets.forEach((timestamp, moduleId) => {
-      if (typeof timestamp === 'number' && moduleId) {
-        tankResetTimestamps.set(moduleId, timestamp)
-      }
-    })
+    updateCompactEmbedStateFromLocation()
     refresh()
     loadCycleHistory(cycleWindow)
     const refreshInterval = setInterval(() => {
       refresh()
-    }, 15000)
+    }, UI_REFRESH_INTERVAL_MS)
     cycleHistoryRefreshTimer = setInterval(() => {
       loadCycleHistory(cycleWindow, { silent: true })
     }, 20000)
+    if (typeof window !== 'undefined') {
+      window.addEventListener('message', handleExternalDashboardMessage)
+      window.addEventListener('hashchange', updateCompactEmbedStateFromLocation)
+    }
     return () => {
       clearInterval(refreshInterval)
       if (cycleHistoryRefreshTimer) {
         clearInterval(cycleHistoryRefreshTimer)
         cycleHistoryRefreshTimer = null
+      }
+      if (typeof window !== 'undefined') {
+        window.removeEventListener('message', handleExternalDashboardMessage)
+        window.removeEventListener('hashchange', updateCompactEmbedStateFromLocation)
       }
       stopWsLogPolling()
     }
@@ -1316,9 +1309,80 @@
     return undefined
   }
 
+  const clampRollerSpeed = (value) => {
+    const numeric = typeof value === 'number' ? value : Number(value)
+    if (!Number.isFinite(numeric)) return undefined
+    return Math.min(Math.max(numeric, ROLLER_SPEED_MIN), ROLLER_SPEED_MAX)
+  }
+
   const clampSetpointValue = (value) => {
     if (typeof value !== 'number' || Number.isNaN(value)) return undefined
     return Math.min(Math.max(value, HEATER_SETPOINT_MIN_BOUND_C), HEATER_SETPOINT_MAX_BOUND_C)
+  }
+
+  const clampHysteresisSpan = (value) => {
+    const numeric = typeof value === 'number' ? value : Number(value)
+    if (!Number.isFinite(numeric)) return undefined
+    const clamped = Math.min(Math.max(numeric, HEATER_HYSTERESIS_MIN_C), HEATER_HYSTERESIS_MAX_C)
+    return Number(clamped.toFixed(2))
+  }
+
+  const clampProbeTolerance = (value) => {
+    const numeric = typeof value === 'number' ? value : Number(value)
+    if (!Number.isFinite(numeric)) return undefined
+    const clamped = Math.min(Math.max(numeric, PROBE_TOLERANCE_MIN_C), PROBE_TOLERANCE_MAX_C)
+    return Number(clamped.toFixed(2))
+  }
+
+  const clampProbeTimeoutS = (value) => {
+    const numeric = typeof value === 'number' ? value : Number(value)
+    if (!Number.isFinite(numeric)) return undefined
+    return Math.round(Math.min(Math.max(numeric, PROBE_TIMEOUT_MIN_S), PROBE_TIMEOUT_MAX_S))
+  }
+
+  const clampRunawayDeltaC = (value) => {
+    const numeric = typeof value === 'number' ? value : Number(value)
+    if (!Number.isFinite(numeric)) return undefined
+    const clamped = Math.min(Math.max(numeric, RUNAWAY_DELTA_MIN_C), RUNAWAY_DELTA_MAX_C)
+    return Number(clamped.toFixed(2))
+  }
+
+  const clampMaxHeaterOnMinutes = (value) => {
+    const numeric = typeof value === 'number' ? value : Number(value)
+    if (!Number.isFinite(numeric)) return undefined
+    return Math.round(Math.min(Math.max(numeric, MAX_HEATER_ON_MIN_MIN), MAX_HEATER_ON_MIN_MAX))
+  }
+
+  const clampStuckRelayDeltaC = (value) => {
+    const numeric = typeof value === 'number' ? value : Number(value)
+    if (!Number.isFinite(numeric)) return undefined
+    const clamped = Math.min(Math.max(numeric, STUCK_RELAY_DELTA_MIN_C), STUCK_RELAY_DELTA_MAX_C)
+    return Number(clamped.toFixed(2))
+  }
+
+  const clampStuckRelayWindowS = (value) => {
+    const numeric = typeof value === 'number' ? value : Number(value)
+    if (!Number.isFinite(numeric)) return undefined
+    return Math.round(Math.min(Math.max(numeric, STUCK_RELAY_WINDOW_MIN_S), STUCK_RELAY_WINDOW_MAX_S))
+  }
+
+  const syncHeaterBandFromSettings = ({ span = heaterHysteresisSpanC, center = temperatureSetpointC } = {}) => {
+    if (typeof center !== 'number' || Number.isNaN(center)) return
+    const normalizedSpan = clampHysteresisSpan(span) ?? DEFAULT_HEATER_HYSTERESIS_SPAN_C
+    const half = Number((normalizedSpan / 2).toFixed(2))
+    const rawMin = clampSetpointValue(center - half)
+    const rawMax = clampSetpointValue(center + half)
+    if (rawMin != null) {
+      heaterSetpointMinC = Number(rawMin.toFixed(1))
+    }
+    if (rawMax != null) {
+      heaterSetpointMaxC = Number(rawMax.toFixed(1))
+    }
+    if (heaterSetpointMinC != null && heaterSetpointMaxC != null) {
+      heaterHysteresisSpanC = Number(Math.max(heaterSetpointMaxC - heaterSetpointMinC, HEATER_HYSTERESIS_MIN_C).toFixed(2))
+    } else {
+      heaterHysteresisSpanC = normalizedSpan
+    }
   }
 
   const computeTankUsageSinceRefill = (module) => {
@@ -1345,7 +1409,8 @@
     const nextHistory = new Map(tankUsageHistory)
     moduleList.forEach((module) => {
       const moduleId = module?.module_id
-      if (!moduleId) return
+      const moduleKey = normalizeModuleId(moduleId)
+      if (!moduleKey) return
       const snapshot = {
         module_id: moduleId,
         ato: {
@@ -1364,83 +1429,20 @@
       }
       const usedMl = computeTankUsageSinceRefill(snapshot)
       if (usedMl == null) return
-      const samples = nextHistory.get(moduleId) ?? []
+      const samples = nextHistory.get(moduleKey) ?? []
       const previousSample = samples.length ? samples[samples.length - 1] : null
-      const resetDetected =
-        previousSample &&
-        typeof previousSample.usedMl === 'number' &&
-        previousSample.usedMl - usedMl > TANK_RESET_THRESHOLD_ML
       samples.push({ timestamp: now, usedMl })
       const filtered = samples.filter((sample) => sample.timestamp >= cutoff)
-      nextHistory.set(moduleId, filtered)
-
-      if (resetDetected || (!previousSample && usedMl <= TANK_RESET_THRESHOLD_ML)) {
-        markTankReset(moduleId, now)
-      } else if (!tankResetTimestamps.has(moduleId)) {
-        const inferred = filtered.find((sample) => sample.usedMl <= TANK_RESET_THRESHOLD_ML)
-        if (inferred) {
-          markTankReset(moduleId, inferred.timestamp)
-        }
-      }
+      nextHistory.set(moduleKey, filtered)
     })
     tankUsageHistory = nextHistory
   }
 
-  function trackSpoolUsage(moduleList = []) {
-    const now = Date.now()
-    let updatedHistory = [...spoolUsageHistory]
 
-    moduleList.forEach((module) => {
-      const snapshot = normalizeSpoolTelemetry(module)
-      if (!snapshot) return
-      const { moduleId, normalizedUsedEdges, mmPerEdge } = snapshot
-      const previous = spoolSnapshots.get(moduleId)
-      if (previous) {
-        const drop = previous.usedEdges - normalizedUsedEdges
-        if (drop > SPOOL_RESET_EDGE_THRESHOLD) {
-          handleSpoolReset(moduleId, now)
-          spoolSnapshots.set(moduleId, { usedEdges: normalizedUsedEdges, timestamp: now })
-          return
-        }
-      }
-
-      if (!previous) {
-        spoolSnapshots.set(moduleId, { usedEdges: normalizedUsedEdges, timestamp: now })
-        return
-      }
-
-      if (normalizedUsedEdges >= previous.usedEdges) {
-        const deltaEdges = normalizedUsedEdges - previous.usedEdges
-        if (deltaEdges > 0) {
-          const deltaMm = deltaEdges * mmPerEdge
-          updatedHistory = [
-            ...updatedHistory,
-            {
-              moduleId,
-              timestamp: now,
-              deltaEdges,
-              deltaMm,
-              totalUsedEdges: normalizedUsedEdges,
-            },
-          ]
-        }
-      }
-
-      spoolSnapshots.set(moduleId, { usedEdges: normalizedUsedEdges, timestamp: now })
-    })
-
-    const cutoff = now - USAGE_HISTORY_WINDOW_MS
-    updatedHistory = updatedHistory.filter((entry) => entry.timestamp >= cutoff)
-    spoolUsageHistory = updatedHistory
-    persistSpoolUsageHistory(spoolUsageHistory)
-  }
-
-  async function loadSpoolUsageHistory(moduleSnapshot = []) {
+  async function loadSpoolUsageHistory() {
     try {
       const windowHours = Math.round(USAGE_HISTORY_WINDOW_HOURS)
       const history = await fetchSpoolUsageHistory(windowHours)
-      const now = Date.now()
-      const cutoff = now - USAGE_HISTORY_WINDOW_MS
       spoolUsageHistory = history
         .map((entry) => ({
           moduleId: entry.module_id,
@@ -1449,17 +1451,100 @@
           deltaMm: entry.delta_mm ?? 0,
           totalUsedEdges: entry.total_used_edges ?? null,
         }))
-        .filter((entry) => {
-          const baseline = getModuleResetBaseline(entry.moduleId)
-          const threshold = Math.max(cutoff, baseline)
-          return entry.timestamp >= threshold
-        })
-      persistSpoolUsageHistory(spoolUsageHistory)
     } catch (err) {
       console.warn('Unable to load spool usage history', err)
-      if (moduleSnapshot.length) {
-        trackSpoolUsage(moduleSnapshot)
+    }
+  }
+
+  async function loadTemperatureHistory() {
+    try {
+      const windowMinutes = Math.round(HEATER_HISTORY_WINDOW_MS / (60 * 1000))
+      const history = await fetchTemperatureHistory(windowMinutes, undefined, 10000)
+      if (!Array.isArray(history)) return
+      const cutoff = Date.now() - HEATER_HISTORY_WINDOW_MS
+      const nextHistory = new Map()
+      const normalized = normalizeTemperatureHistorySamples(history)
+      normalized.forEach((entry) => {
+        if (!entry || typeof entry !== 'object') return
+        const moduleId = entry.moduleId
+        const timestamp = Number(entry.timestamp)
+        if (!moduleId || !Number.isFinite(timestamp) || timestamp < cutoff) return
+        const thermometers = (entry.thermistors ?? [])
+          .map((reading, index) => ({
+            key: buildThermometerKey(reading?.label, index),
+            label: reading?.label ?? `Thermometer ${index + 1}`,
+            value: reading?.value,
+          }))
+          .filter((reading) => typeof reading?.value === 'number' && Number.isFinite(reading.value))
+        if (!thermometers.length) return
+        const sample = {
+          timestamp,
+          thermometers,
+          heaterState: Boolean(entry.heaterOn),
+          heaterDescription: Boolean(entry.heaterOn) ? 'Heating' : 'Idle',
+        }
+        const samples = nextHistory.get(moduleId) ?? []
+        samples.push(sample)
+        nextHistory.set(moduleId, samples)
+      })
+
+      nextHistory.forEach((samples, moduleId) => {
+        const sorted = [...samples].sort((left, right) => left.timestamp - right.timestamp)
+        nextHistory.set(moduleId, alignSamplesByResolution(sorted, UI_REFRESH_INTERVAL_MS))
+      })
+
+      if (nextHistory.size) {
+        heaterTelemetryHistory = nextHistory
       }
+    } catch (err) {
+      console.warn('Unable to load heater temperature history', err)
+    }
+  }
+
+  async function loadLogHistoryBackfill(windowHours = USAGE_HISTORY_WINDOW_HOURS) {
+    try {
+      const [spoolSamples, atoSamples] = await Promise.all([
+        fetchSpoolTraceHistory(windowHours, undefined, 10000),
+        fetchAtoTraceHistory(windowHours, undefined, 10000),
+      ])
+
+      const nextSpool = new Map()
+      ;(Array.isArray(spoolSamples) ? spoolSamples : []).forEach((sample) => {
+        if (!sample || typeof sample !== 'object') return
+        const moduleId = sample.module_id
+        const timestamp = Number(sample.timestamp)
+        const usedMm = typeof sample.used_mm === 'number' ? sample.used_mm : Number(sample.used_mm)
+        if (!moduleId || !Number.isFinite(timestamp) || !Number.isFinite(usedMm)) return
+        const bucket = nextSpool.get(moduleId) ?? []
+        bucket.push({ timestamp, usedMm })
+        nextSpool.set(moduleId, bucket)
+      })
+
+      const nextAto = new Map()
+      ;(Array.isArray(atoSamples) ? atoSamples : []).forEach((sample) => {
+        if (!sample || typeof sample !== 'object') return
+        const moduleId = sample.module_id
+        const timestamp = Number(sample.timestamp)
+        const usedMl = typeof sample.used_ml === 'number' ? sample.used_ml : Number(sample.used_ml)
+        if (!moduleId || !Number.isFinite(timestamp) || !Number.isFinite(usedMl)) return
+        const bucket = nextAto.get(moduleId) ?? []
+        bucket.push({ timestamp, usedMl })
+        nextAto.set(moduleId, bucket)
+      })
+
+      nextSpool.forEach((samples, moduleId) => {
+        const sorted = [...samples].sort((a, b) => a.timestamp - b.timestamp)
+        nextSpool.set(moduleId, downsampleByTimestamp(sorted, UI_REFRESH_INTERVAL_MS))
+      })
+      nextAto.forEach((samples, moduleId) => {
+        const sorted = [...samples].sort((a, b) => a.timestamp - b.timestamp)
+        nextAto.set(moduleId, downsampleByTimestamp(sorted, UI_REFRESH_INTERVAL_MS))
+      })
+
+      spoolLevelHistory = nextSpool
+      atoLevelHistory = nextAto
+    } catch (err) {
+      console.warn('Unable to load websocket log backfill history', err)
     }
   }
 
@@ -1728,6 +1813,66 @@
     return null
   }
 
+  const getHeaterSamplesForModule = (module = {}) => {
+    const moduleId = module?.module_id
+    if (!moduleId) return []
+    const direct = heaterTelemetryHistory.get(moduleId)
+    if (Array.isArray(direct) && direct.length) return direct
+    for (const [candidateId, samples] of heaterTelemetryHistory.entries()) {
+      if (!moduleIdMatches(candidateId, moduleId)) continue
+      return Array.isArray(samples) ? samples : []
+    }
+    return []
+  }
+
+  const computeHeaterOnPercent = (samples = [], windowMs = HEATER_DUTY_WINDOW_MS) => {
+    if (!Array.isArray(samples) || !samples.length || windowMs <= 0) return null
+    const now = Date.now()
+    const cutoff = now - windowMs
+    let previousSample = null
+    const inWindow = []
+    for (const sample of samples) {
+      if (!sample || typeof sample.timestamp !== 'number') continue
+      if (sample.timestamp <= cutoff) {
+        previousSample = sample
+        continue
+      }
+      if (sample.timestamp > now) continue
+      inWindow.push(sample)
+    }
+
+    const timeline = []
+    if (previousSample) {
+      timeline.push({ ...previousSample, timestamp: cutoff })
+    }
+    timeline.push(...inWindow)
+    if (!timeline.length) return null
+
+    let onMs = 0
+    for (let index = 0; index < timeline.length; index += 1) {
+      const current = timeline[index]
+      const next = timeline[index + 1]
+      const start = Math.max(cutoff, current.timestamp)
+      const end = next ? Math.min(now, next.timestamp) : now
+      if (end <= start) continue
+      if (current.heaterState) {
+        onMs += end - start
+      }
+    }
+
+    const percent = (onMs / windowMs) * 100
+    return Number.isFinite(percent) ? Math.max(0, Math.min(100, percent)) : null
+  }
+
+  const getHeaterDutyPercentLastHour = (module = {}) => {
+    const liveSamples = getHeaterSamplesForModule(module)
+    const rollingPercent = computeHeaterOnPercent(liveSamples, HEATER_DUTY_WINDOW_MS)
+    if (typeof rollingPercent === 'number') {
+      return rollingPercent
+    }
+    return getHeaterDutyCyclePercent(module)
+  }
+
   const formatDutyCycleLabel = (value) => {
     if (typeof value !== 'number' || Number.isNaN(value)) return '—'
     const clamped = Math.max(0, Math.min(100, value))
@@ -1748,12 +1893,12 @@
         active,
       }
     }
-    const dutyPercent = getHeaterDutyCyclePercent(module)
+    const dutyPercent = getHeaterDutyPercentLastHour(module)
     if (typeof dutyPercent === 'number') {
       const active = dutyPercent >= 1
       return {
         label: active ? 'On' : 'Off',
-        description: `${formatDutyCycleLabel(dutyPercent)} duty`,
+        description: `${formatDutyCycleLabel(dutyPercent)} duty (1h)`,
         active,
       }
     }
@@ -1767,7 +1912,7 @@
   const buildHeaterSummary = (module = {}) => ({
     thermometers: getHeaterThermometers(module),
     heaterState: describeHeaterPowerState(module),
-    dutyPercent: getHeaterDutyCyclePercent(module),
+    dutyPercent: getHeaterDutyPercentLastHour(module),
   })
 
   const deriveModulePumpTimeout = (module = {}) =>
@@ -2116,6 +2261,8 @@
       return
     }
 
+    alarmActionError = ''
+
     const [next, ...rest] = alarmQueue
     alarmQueue = rest
 
@@ -2136,6 +2283,27 @@
     presentNextAlarm()
   }
 
+  async function snoozeActiveAlarm() {
+    if (!activeAlarmModal || alarmActionBusy) return
+    const moduleId = activeAlarmModal.moduleId
+    if (!moduleId) {
+      alarmActionError = 'Alarm module id is unavailable.'
+      return
+    }
+
+    alarmActionBusy = true
+    alarmActionError = ''
+    try {
+      await updateModuleControls(moduleId, { alarm_snooze: true })
+      acknowledgeAlarm()
+      await refresh()
+    } catch (err) {
+      alarmActionError = err?.message ?? 'Failed to snooze alarm.'
+    } finally {
+      alarmActionBusy = false
+    }
+  }
+
   function focusAlarmModule() {
     if (!activeAlarmModal) return
     focusModuleCard(activeAlarmModal.moduleId, guessSubsystemFromAlert(activeAlarmModal))
@@ -2151,20 +2319,10 @@
     return `${mins}m` + (seconds % 60 ? ` ${seconds % 60}s` : '')
   }
 
-  const getMetricAverage = (metric) => {
-    const match = summary.find((item) => item.metric === metric)
-    if (!match) return null
-    const value = typeof match.avg_value === 'number' ? match.avg_value : Number(match.avg_value)
-    return Number.isFinite(value) ? value : null
-  }
-
   const formatValue = (metric) => {
     const { unit = '' } = metricCopy[metric] ?? {}
     if (metric === 'temperature') {
-      const current = heroCurrentTempC ?? getMetricAverage(metric)
-      if (current != null) {
-        return `${current.toFixed(2)} ${unit}`.trim()
-      }
+      return heroTemperatureDisplay
     }
     const latest = latestByMetric[metric]
     if (!latest || typeof latest.value !== 'number') {
@@ -2175,11 +2333,193 @@
 
   const formatTimestamp = (timestamp) => new Date(timestamp).toLocaleTimeString()
 
+  const buildControlPrefillStamp = (module) => {
+    const source = module && typeof module === 'object' ? module : null
+    if (!source) return ''
+    const config = source.configPayload ?? source.config_payload ?? {}
+    const status = source.statusPayload ?? source.status_payload ?? {}
+    const configMotor = config.motor ?? {}
+    const statusMotor = status.motor ?? {}
+    const configAto = config.ato ?? {}
+    const statusAto = status.ato ?? {}
+    const configSystem = config.system ?? {}
+    const statusSystem = status.system ?? {}
+    const configSpool = config.spool ?? {}
+    const statusSpool = status.spool ?? {}
+    const configHeater = config.heater ?? {}
+    const statusHeaterFromRoot = status.heater ?? {}
+    const statusHeaterFromSubsystem =
+      Array.isArray(status.subsystems)
+        ? status.subsystems.find(
+            (entry) =>
+              entry &&
+              typeof entry === 'object' &&
+              ((entry.kind ?? '').toString().toLowerCase() === 'heater' ||
+                (entry.key ?? '').toString().toLowerCase() === 'heater')
+          )
+        : null
+    const statusHeater = {
+      ...(statusHeaterFromSubsystem ?? {}),
+      ...(statusHeaterFromRoot ?? {}),
+      setpoints: {
+        ...((statusHeaterFromSubsystem?.setpoints ?? {})),
+        ...((statusHeaterFromRoot?.setpoints ?? {})),
+      },
+    }
+
+    const pickNumber = (...values) => coalesceNumber(...values)
+
+    const setpointMin = pickNumber(
+      statusHeater.setpoint_min_c,
+      configHeater.setpoint_min_c,
+      statusHeater.setpoint_low_c,
+      configHeater.setpoint_low_c,
+      statusHeater.minimum_c,
+      configHeater.minimum_c
+    )
+    const setpointMax = pickNumber(
+      statusHeater.setpoint_max_c,
+      configHeater.setpoint_max_c,
+      statusHeater.setpoint_high_c,
+      configHeater.setpoint_high_c,
+      statusHeater.maximum_c,
+      configHeater.maximum_c
+    )
+
+    const snapshot = {
+      moduleId: source.module_id ?? '',
+      atoMode: deriveAtoMode(source),
+      motorRunTimeMs: pickNumber(
+        configMotor.run_time_ms,
+        configMotor.runtime_ms,
+        statusMotor.run_time_ms,
+        statusMotor.runtime_ms,
+        source.motor?.run_time_ms,
+        source.motor?.runtime_ms
+      ),
+      rollerSpeed: pickNumber(
+        configMotor.max_speed,
+        configMotor.speed,
+        statusMotor.max_speed,
+        statusMotor.speed,
+        source.motor?.max_speed,
+        source.motor?.speed
+      ),
+      pumpTimeoutMs: pickNumber(
+        configSystem.pump_timeout_ms,
+        statusSystem.pump_timeout_ms,
+        configAto.timeout_ms,
+        statusAto.timeout_ms,
+        source.system?.pump_timeout_ms,
+        source.ato?.timeout_ms
+      ),
+      alarmChirpIntervalMs: pickNumber(
+        configSystem.alarm_chirp_interval_ms,
+        statusSystem.alarm_chirp_interval_ms,
+        configSystem.chirp_interval_ms,
+        statusSystem.chirp_interval_ms,
+        source.system?.alarm_chirp_interval_ms,
+        source.system?.chirp_interval_ms
+      ),
+      spoolLengthMm: pickNumber(
+        configSpool.length_mm,
+        configSpool.total_length_mm,
+        statusSpool.total_length_mm,
+        statusSpool.length_mm,
+        source.spool?.total_length_mm,
+        source.spool?.length_mm
+      ),
+      mediaThicknessUm: pickNumber(
+        configSpool.media_thickness_um,
+        statusSpool.media_thickness_um,
+        source.spool?.media_thickness_um
+      ),
+      coreDiameterMm: pickNumber(
+        configSpool.core_diameter_mm,
+        statusSpool.core_diameter_mm,
+        source.spool?.core_diameter_mm
+      ),
+      heaterSetpointC: pickNumber(
+        statusHeater.setpoint_c,
+        statusHeater.setpoints?.setpoint_c,
+        configHeater.setpoint_c,
+        configHeater.setpoints?.setpoint_c,
+        statusHeater.target_c,
+        configHeater.target_c,
+        statusHeater.average_temp_c,
+        configHeater.average_temp_c
+      ),
+      heaterSetpointMinC: setpointMin,
+      heaterSetpointMaxC: setpointMax,
+      heaterHysteresisSpanC: pickNumber(
+        statusHeater.hysteresis_span_c,
+        configHeater.hysteresis_span_c,
+        statusHeater.setpoints?.hysteresis_span_c,
+        configHeater.setpoints?.hysteresis_span_c,
+        typeof statusHeater.hysteresis_half_c === 'number' ? statusHeater.hysteresis_half_c * 2 : undefined,
+        typeof configHeater.hysteresis_half_c === 'number' ? configHeater.hysteresis_half_c * 2 : undefined,
+        setpointMin != null && setpointMax != null ? Math.abs(setpointMax - setpointMin) : undefined
+      ),
+      heaterProbeToleranceC: pickNumber(
+        statusHeater.probe_tolerance_c,
+        configHeater.probe_tolerance_c,
+        statusHeater.thermistor_delta_limit_c,
+        configHeater.thermistor_delta_limit_c,
+        statusHeater.setpoints?.probe_tolerance_c,
+        configHeater.setpoints?.probe_tolerance_c
+      ),
+      heaterProbeTimeoutS: pickNumber(
+        statusHeater.probe_timeout_s,
+        statusHeater.setpoints?.probe_timeout_s,
+        configHeater.probe_timeout_s,
+        configHeater.setpoints?.probe_timeout_s
+      ),
+      heaterRunawayDeltaC: pickNumber(
+        statusHeater.runaway_delta_c,
+        statusHeater.setpoints?.runaway_delta_c,
+        configHeater.runaway_delta_c,
+        configHeater.setpoints?.runaway_delta_c
+      ),
+      heaterMaxOnMinutes: pickNumber(
+        statusHeater.max_heater_on_min,
+        statusHeater.heater_timeout_min,
+        statusHeater.setpoints?.max_heater_on_min,
+        configHeater.max_heater_on_min,
+        configHeater.heater_timeout_min,
+        configHeater.setpoints?.max_heater_on_min
+      ),
+      heaterStuckRelayDeltaC: pickNumber(
+        statusHeater.stuck_relay_delta_c,
+        statusHeater.setpoints?.stuck_relay_delta_c,
+        configHeater.stuck_relay_delta_c,
+        configHeater.setpoints?.stuck_relay_delta_c
+      ),
+      heaterStuckRelayWindowS: pickNumber(
+        statusHeater.stuck_relay_window_s,
+        statusHeater.relay_timeout_s,
+        statusHeater.setpoints?.stuck_relay_window_s,
+        configHeater.stuck_relay_window_s,
+        configHeater.relay_timeout_s,
+        configHeater.setpoints?.stuck_relay_window_s
+      ),
+    }
+
+    return JSON.stringify(snapshot)
+  }
+
   const prefillControls = (module) => {
     if (!module) return
     controlsPrefilledFor = module.module_id
+    controlsPrefilledStamp = buildControlPrefillStamp(module)
     heaterSetpointMinC = undefined
     heaterSetpointMaxC = undefined
+    heaterHysteresisSpanC = DEFAULT_HEATER_HYSTERESIS_SPAN_C
+    heaterProbeToleranceC = DEFAULT_PROBE_TOLERANCE_C
+    heaterProbeTimeoutS = DEFAULT_PROBE_TIMEOUT_S
+    heaterRunawayDeltaC = DEFAULT_RUNAWAY_DELTA_C
+    heaterMaxOnMinutes = DEFAULT_MAX_HEATER_ON_MIN
+    heaterStuckRelayDeltaC = DEFAULT_STUCK_RELAY_DELTA_C
+    heaterStuckRelayWindowS = DEFAULT_STUCK_RELAY_WINDOW_S
     atoMode = deriveAtoMode(module)
     const configMotor = module.configPayload?.motor ?? {}
     const statusMotor = module.statusPayload?.motor ?? {}
@@ -2192,22 +2532,39 @@
       configMotor.run_time_ms,
       configMotor.runtime_ms,
       statusMotor.run_time_ms,
-      statusMotor.runtime_ms
+      statusMotor.runtime_ms,
+      module.motor?.run_time_ms,
+      module.motor?.runtime_ms
     ) ?? DEFAULT_RUNTIME
 
-    rollerSpeed = coalesceNumber(configMotor.max_speed, statusMotor.speed) ?? DEFAULT_ROLLER_SPEED
+    const resolvedRollerSpeed =
+      coalesceNumber(
+        configMotor.max_speed,
+        configMotor.speed,
+        statusMotor.max_speed,
+        statusMotor.speed,
+        module.motor?.max_speed,
+        module.motor?.speed
+      ) ?? DEFAULT_ROLLER_SPEED
+    rollerSpeed = clampRollerSpeed(resolvedRollerSpeed) ?? DEFAULT_ROLLER_SPEED
     pumpTimeoutMs =
       coalesceNumber(
         configSystem.pump_timeout_ms,
         statusSystem.pump_timeout_ms,
-        module.system?.pump_timeout_ms
+        configAto.timeout_ms,
+        statusAto.timeout_ms,
+        module.system?.pump_timeout_ms,
+        module.ato?.timeout_ms
       ) ?? DEFAULT_PUMP_TIMEOUT_MS
 
     alarmChirpIntervalMs =
       coalesceNumber(
         configSystem.alarm_chirp_interval_ms,
         statusSystem.alarm_chirp_interval_ms,
-        module.system?.alarm_chirp_interval_ms
+        configSystem.chirp_interval_ms,
+        statusSystem.chirp_interval_ms,
+        module.system?.alarm_chirp_interval_ms,
+        module.system?.chirp_interval_ms
       ) ?? DEFAULT_ALARM_CHIRP_INTERVAL_MS
 
     spoolLengthMm =
@@ -2231,12 +2588,34 @@
       ) ?? DEFAULT_CORE_DIAMETER_MM
 
     const configHeater = module.configPayload?.heater ?? {}
-    const statusHeater = module.statusPayload?.heater ?? {}
+    const statusHeaterFromRoot = module.statusPayload?.heater ?? {}
+    const statusHeaterFromSubsystem =
+      Array.isArray(module.statusPayload?.subsystems)
+        ? module.statusPayload.subsystems.find(
+            (entry) =>
+              entry &&
+              typeof entry === 'object' &&
+              ((entry.kind ?? '').toString().toLowerCase() === 'heater' ||
+                (entry.key ?? '').toString().toLowerCase() === 'heater')
+          )
+        : null
+    const statusHeater = {
+      ...(statusHeaterFromSubsystem ?? {}),
+      ...(statusHeaterFromRoot ?? {}),
+      setpoints: {
+        ...((statusHeaterFromSubsystem?.setpoints ?? {})),
+        ...((statusHeaterFromRoot?.setpoints ?? {})),
+      },
+    }
     const mergedHeater = { ...configHeater, ...statusHeater, ...(module.heater ?? {}) }
 
     const resolvedSetpoint = coalesceNumber(
       mergedHeater.setpoint_c,
+      mergedHeater.setpoints?.setpoint_c,
       mergedHeater.target_c,
+      configHeater.setpoint_c,
+      configHeater.setpoints?.setpoint_c,
+      configHeater.target_c,
       mergedHeater.average_temp_c
     )
     if (resolvedSetpoint != null) {
@@ -2245,9 +2624,13 @@
 
     const resolvedMin = coalesceNumber(
       mergedHeater.setpoint_min_c,
+      mergedHeater.setpoints?.setpoint_min_c,
       mergedHeater.setpoint_low_c,
       mergedHeater.minimum_c,
-      configHeater.setpoint_min_c
+      configHeater.setpoint_low_c,
+      configHeater.minimum_c,
+      configHeater.setpoint_min_c,
+      configHeater.setpoints?.setpoint_min_c
     )
     if (resolvedMin != null) {
       heaterSetpointMinC = clampSetpointValue(resolvedMin)
@@ -2255,9 +2638,13 @@
 
     const resolvedMax = coalesceNumber(
       mergedHeater.setpoint_max_c,
+      mergedHeater.setpoints?.setpoint_max_c,
       mergedHeater.setpoint_high_c,
       mergedHeater.maximum_c,
-      configHeater.setpoint_max_c
+      configHeater.setpoint_high_c,
+      configHeater.maximum_c,
+      configHeater.setpoint_max_c,
+      configHeater.setpoints?.setpoint_max_c
     )
     if (resolvedMax != null) {
       heaterSetpointMaxC = clampSetpointValue(resolvedMax)
@@ -2270,6 +2657,84 @@
     ) {
       heaterSetpointMaxC = heaterSetpointMinC
     }
+
+    const resolvedSpan = (() => {
+      const candidates = [
+        mergedHeater?.hysteresis_span_c,
+        mergedHeater?.setpoints?.hysteresis_span_c,
+        typeof mergedHeater?.hysteresis_half_c === 'number' ? mergedHeater.hysteresis_half_c * 2 : undefined,
+        typeof mergedHeater?.setpoints?.hysteresis_half_c === 'number'
+          ? mergedHeater.setpoints.hysteresis_half_c * 2
+          : undefined,
+        heaterSetpointMinC != null && heaterSetpointMaxC != null
+          ? Math.abs(heaterSetpointMaxC - heaterSetpointMinC)
+          : undefined,
+      ]
+      return candidates.find((value) => typeof value === 'number' && Number.isFinite(value))
+    })()
+    const normalizedSpan = clampHysteresisSpan(resolvedSpan)
+    if (normalizedSpan != null) {
+      heaterHysteresisSpanC = normalizedSpan
+    } else if (heaterSetpointMinC != null && heaterSetpointMaxC != null) {
+      heaterHysteresisSpanC = Number(Math.abs(heaterSetpointMaxC - heaterSetpointMinC).toFixed(2)) || DEFAULT_HEATER_HYSTERESIS_SPAN_C
+    }
+
+    if (heaterSetpointMinC == null || heaterSetpointMaxC == null) {
+      syncHeaterBandFromSettings({ span: heaterHysteresisSpanC })
+    }
+
+    const resolvedTolerance = coalesceNumber(
+      mergedHeater?.probe_tolerance_c,
+      mergedHeater?.thermistor_delta_limit_c,
+      mergedHeater?.setpoints?.probe_tolerance_c,
+      configHeater.probe_tolerance_c
+    )
+    heaterProbeToleranceC = clampProbeTolerance(resolvedTolerance) ?? DEFAULT_PROBE_TOLERANCE_C
+
+    const resolvedProbeTimeout = coalesceNumber(
+      mergedHeater?.probe_timeout_s,
+      mergedHeater?.setpoints?.probe_timeout_s,
+      configHeater?.probe_timeout_s,
+      configHeater?.setpoints?.probe_timeout_s
+    )
+    heaterProbeTimeoutS = clampProbeTimeoutS(resolvedProbeTimeout) ?? DEFAULT_PROBE_TIMEOUT_S
+
+    const resolvedRunawayDelta = coalesceNumber(
+      mergedHeater?.runaway_delta_c,
+      mergedHeater?.setpoints?.runaway_delta_c,
+      configHeater?.runaway_delta_c,
+      configHeater?.setpoints?.runaway_delta_c
+    )
+    heaterRunawayDeltaC = clampRunawayDeltaC(resolvedRunawayDelta) ?? DEFAULT_RUNAWAY_DELTA_C
+
+    const resolvedMaxOnMinutes = coalesceNumber(
+      mergedHeater?.max_heater_on_min,
+      mergedHeater?.heater_timeout_min,
+      mergedHeater?.setpoints?.max_heater_on_min,
+      configHeater?.max_heater_on_min,
+      configHeater?.heater_timeout_min,
+      configHeater?.setpoints?.max_heater_on_min
+    )
+    heaterMaxOnMinutes = clampMaxHeaterOnMinutes(resolvedMaxOnMinutes) ?? DEFAULT_MAX_HEATER_ON_MIN
+
+    const resolvedStuckRelayDelta = coalesceNumber(
+      mergedHeater?.stuck_relay_delta_c,
+      mergedHeater?.setpoints?.stuck_relay_delta_c,
+      configHeater?.stuck_relay_delta_c,
+      configHeater?.setpoints?.stuck_relay_delta_c
+    )
+    heaterStuckRelayDeltaC = clampStuckRelayDeltaC(resolvedStuckRelayDelta) ?? DEFAULT_STUCK_RELAY_DELTA_C
+
+    const resolvedStuckRelayWindow = coalesceNumber(
+      mergedHeater?.stuck_relay_window_s,
+      mergedHeater?.relay_timeout_s,
+      mergedHeater?.setpoints?.stuck_relay_window_s,
+      configHeater?.stuck_relay_window_s,
+      configHeater?.relay_timeout_s,
+      configHeater?.setpoints?.stuck_relay_window_s
+    )
+    heaterStuckRelayWindowS =
+      clampStuckRelayWindowS(resolvedStuckRelayWindow) ?? DEFAULT_STUCK_RELAY_WINDOW_S
   }
 
   $: hydratedModules = modules.map(hydrateModule)
@@ -2291,13 +2756,47 @@
     const moduleId = getCardModuleId(selectedCard)
     return hydratedModules.find((module) => module.module_id === moduleId)
   })()
-  $: atoWaterUsedSinceRefillMl = computeTankUsageSinceRefill(selectedModule)
+  $: rollerModule = (() => {
+    if (selectedModule && moduleHasSpoolSignals(selectedModule)) {
+      return selectedModule
+    }
+    return hydratedModules.find((module) => moduleHasSpoolSignals(module))
+  })()
+  $: rollerModuleId = rollerModule?.module_id ?? ''
+  $: atoModule = (() => {
+    if (selectedModule && moduleHasAtoSignals(selectedModule)) {
+      return selectedModule
+    }
+    return hydratedModules.find((module) => moduleHasAtoSignals(module))
+  })()
+  $: atoModuleId = atoModule?.module_id ?? (rollerModuleId || '')
+  $: heaterModule = (() => {
+    if (selectedModule && moduleLooksLikeHeater(selectedModule)) {
+      return selectedModule
+    }
+    return hydratedModules.find((module) => moduleLooksLikeHeater(module))
+  })()
+  $: primaryHeaterModule = hydratedModules.find((module) => matchesPrimaryHeaterModule(module?.module_id)) ?? null
+  $: primaryHeaterCard = moduleCards.find((card) => isHeaterCard(card) && matchesPrimaryHeaterModule(card?.module_id)) ?? null
+  $: heaterModuleId = heaterModule?.module_id ?? ''
+  $: atoWaterUsedSinceRefillMl = computeTankUsageSinceRefill(atoModule ?? selectedModule)
   $: selectedPhysicalModuleId = selectedModule?.module_id ?? ''
-  $: selectedSubsystem = getCardSubsystem(selectedCard) || 'roller'
-  $: isRollerView = isRollerSubsystem(selectedSubsystem)
-  $: isAtoView = normalizeSubsystemKind(selectedSubsystem) === 'ato'
-  $: isHeaterView = isHeaterSubsystem(selectedSubsystem)
-  $: if (selectedPhysicalModuleId && selectedPhysicalModuleId !== controlsPrefilledFor && selectedModule) {
+  $: selectedSubsystem = pickPreferredSubsystem(selectedCard, selectedModule)
+  $: isRollerView = isRollerSubsystem(selectedSubsystem) && moduleSupportsSubsystemKind(selectedModule, 'roller')
+  $: isAtoView = normalizeSubsystemKind(selectedSubsystem) === 'ato' && moduleSupportsSubsystemKind(selectedModule, 'ato')
+  $: isHeaterView = isHeaterSubsystem(selectedSubsystem) && moduleSupportsSubsystemKind(selectedModule, 'heater')
+  $: controlPrefillSignature = selectedModule ? buildControlPrefillStamp(selectedModule) : ''
+  $: if (
+    selectedPhysicalModuleId &&
+    selectedModule &&
+    !controlUpdateTimer &&
+    !controlBusy &&
+    !controlUpdatePending &&
+    (
+      selectedPhysicalModuleId !== controlsPrefilledFor ||
+      controlPrefillSignature !== controlsPrefilledStamp
+    )
+  ) {
     prefillControls(selectedModule)
   }
   $: spoolState = selectedModule?.spool ?? {}
@@ -2334,17 +2833,27 @@
   $: if (!spoolCalibrationAwaitingAck) {
     stopCalibrationAckPolling()
   }
-  $: selectedModuleUsage = spoolUsageHistory.filter((entry) => entry.moduleId === selectedPhysicalModuleId)
-  $: moduleSpoolBaselineMs = (() => {
-    void spoolResetVersion
-    if (!selectedPhysicalModuleId) return 0
-    return getModuleResetBaseline(selectedPhysicalModuleId)
+  $: rollerUsageEntries = (() => {
+    if (!rollerModuleId) {
+      return spoolUsageHistory
+    }
+    const matching = spoolUsageHistory.filter((entry) => moduleIdMatches(entry.moduleId, rollerModuleId))
+    return matching.length ? matching : spoolUsageHistory
   })()
-  $: usageEntriesSinceBaseline = (() => {
-    const baseline = moduleSpoolBaselineMs || 0
-    return selectedModuleUsage.filter((entry) => entry.timestamp >= baseline)
+  $: orderedRollerUsageEntries = [...rollerUsageEntries].sort((a, b) => a.timestamp - b.timestamp)
+  $: selectedSpoolLevelSamples = (() => {
+    if (rollerModuleId) {
+      for (const [moduleId, samples] of spoolLevelHistory.entries()) {
+        if (!moduleIdMatches(moduleId, rollerModuleId)) continue
+        return samples ?? []
+      }
+    }
+    for (const samples of spoolLevelHistory.values()) {
+      if (Array.isArray(samples) && samples.length) return samples
+    }
+    return []
   })()
-  $: spoolLifetimeUsageMm = usageEntriesSinceBaseline.reduce((sum, entry) => sum + entry.deltaMm, 0)
+  $: spoolLifetimeUsageMm = rollerUsageEntries.reduce((sum, entry) => sum + entry.deltaMm, 0)
   $: spoolReportedActivations = coalesceNumber(
     spoolState?.activations,
     spoolState?.activation_count,
@@ -2358,14 +2867,18 @@
     typeof spoolLifetimeActivationCount === 'number' && spoolLifetimeActivationCount > 0
       ? spoolLifetimeUsageMm / spoolLifetimeActivationCount
       : null
-  $: spoolBaselineTimestamp = moduleSpoolBaselineMs || null
-  $: rawAtoActivationCount = coalesceNumber(
-    selectedModule?.ato?.activations,
-    selectedModule?.ato?.activation_count,
-    selectedModule?.ato?.activationCount,
-    selectedModule?.statusPayload?.ato?.activations,
-    selectedModule?.status_payload?.ato?.activations
-  )
+  $: spoolBaselineTimestamp = orderedRollerUsageEntries[0]?.timestamp ?? null
+  $: rawAtoActivationCount = (() => {
+    const source = atoModule ?? selectedModule
+    if (!source) return undefined
+    return coalesceNumber(
+      source?.ato?.activations,
+      source?.ato?.activation_count,
+      source?.ato?.activationCount,
+      source?.statusPayload?.ato?.activations,
+      source?.status_payload?.ato?.activations
+    )
+  })()
   $: atoLifetimeActivationCount =
     typeof rawAtoActivationCount === 'number' && Number.isFinite(rawAtoActivationCount)
       ? Math.max(0, Math.round(rawAtoActivationCount))
@@ -2376,74 +2889,71 @@
     atoLifetimeActivationCount > 0
       ? atoWaterUsedSinceRefillMl / atoLifetimeActivationCount
       : null
-  $: tankLastRefillTimestamp = (() => {
-    if (!selectedPhysicalModuleId) return null
-    const stored = tankResetTimestamps.get(selectedPhysicalModuleId)
-    if (typeof stored === 'number') return stored
-    return findRecentTankResetTimestamp(selectedTankUsageSamples)
-  })()
+  $: tankLastRefillTimestamp = findRecentResetTimestamp(selectedTankUsageSamples, {
+    valueKey: 'usedMl',
+    resetThreshold: TANK_RESET_THRESHOLD_ML,
+  })
   $: usageChart = (() => {
-    const now = Date.now()
-    const baseline = moduleSpoolBaselineMs || 0
-    const cutoff = Math.max(now - usageChartWindowMs, baseline)
-    const entries = selectedModuleUsage
-      .filter((entry) => entry.timestamp >= cutoff)
-      .sort((a, b) => a.timestamp - b.timestamp)
-    let cumulative = 0
-    const normalized = entries.map((entry) => {
-      cumulative += entry.deltaMm
-      return {
-        timestamp: entry.timestamp,
-        ts: entry.timestamp,
-        cumulativeMm: cumulative,
-      }
+    const cutoff = Date.now() - usageChartWindowMs
+    const series = buildUsageSeriesPreferLevels({
+      levelSamples: selectedSpoolLevelSamples,
+      deltaEntries: orderedRollerUsageEntries,
+      cutoff,
+      levelValueKey: 'usedMm',
+      deltaValueKey: 'deltaMm',
+      tailLimit: 240,
     })
-    const maxValue = Math.max(...normalized.map((point) => point.cumulativeMm), 0)
-    const points = maxValue > 0 ? normalized : []
     return {
-      points,
-      totalMm: cumulative,
-      windowStart: cutoff,
-      maxValue,
+      points: series.points.map((point) => ({
+        timestamp: point.ts,
+        ts: point.ts,
+        cumulativeMm: point.value,
+      })),
+      totalMm: series.total,
+      windowStart: series.windowStart,
+      maxValue: series.maxValue,
     }
   })()
   $: usageActivationMarkers = (() => {
-    if (!selectedPhysicalModuleId) return []
-    const now = Date.now()
-    const baseline = moduleSpoolBaselineMs || 0
-    const cutoff = Math.max(now - usageChartWindowMs, baseline)
+    if (!rollerModuleId) return []
+    const cutoff = Date.now() - usageChartWindowMs
     return (rollerRuns ?? [])
-      .filter((run) => run.module_id === selectedPhysicalModuleId)
+      .filter((run) => moduleIdMatches(run.module_id, rollerModuleId))
       .map((run) => ({
         timestamp: run.recorded_at,
         ts: new Date(run.recorded_at).getTime(),
       }))
       .filter((run) => run.ts >= cutoff)
   })()
-  $: usageYAxisMax = usageChart.maxValue ? usageChart.maxValue * 1.1 : undefined
-  $: usageChartDatasets = usageChart.points.length
-    ? [
-        {
-          label: 'Media used',
-          data: usageChart.points.map((point) => ({ x: point.ts, y: point.cumulativeMm })),
-          borderColor: 'rgba(72, 229, 194, 0.9)',
-          backgroundColor: 'rgba(72, 229, 194, 0.15)',
-          borderWidth: 2,
-          fill: false,
-          tension: 0.25,
-          pointRadius: 3,
-          pointHoverRadius: 4,
-          pointBackgroundColor: '#f6c343',
-          pointBorderColor: '#020710',
-        },
-        ...buildActivationDatasets(usageActivationMarkers, usageChart.maxValue || 0),
-      ]
-    : []
+  $: usageActivationYMax = usageChart.maxValue || (usageActivationMarkers.length ? 1 : 0)
+  $: usageYAxisMax = usageActivationYMax ? usageActivationYMax * 1.1 : undefined
+  $: usageChartDatasets = [
+    ...(usageChart.points.length
+      ? [
+          {
+            label: 'Media used',
+            data: usageChart.points.map((point) => ({ x: point.ts, y: point.cumulativeMm })),
+            borderColor: 'rgba(72, 229, 194, 0.9)',
+            backgroundColor: 'rgba(72, 229, 194, 0.15)',
+            borderWidth: 2.6,
+            fill: false,
+            tension: 0.32,
+            pointRadius: 0,
+            pointHoverRadius: 2,
+            pointBackgroundColor: '#f6c343',
+            pointBorderColor: '#020710',
+          },
+        ]
+      : []),
+    ...buildActivationDatasets(usageActivationMarkers, usageActivationYMax),
+  ]
+  $: usageChartHasData = hasRenderableChartData(usageChartDatasets)
+  $: usageChartLoading = loading && !usageChartHasData
   $: rollerRuns = cycleHistory?.roller_runs ?? []
   $: atoRuns = cycleHistory?.ato_runs ?? []
   $: activeCycleWindowHours = cycleHistory?.window_hours ?? cycleWindow
-  $: selectedAtoRuns = selectedPhysicalModuleId
-    ? atoRuns.filter((run) => run.module_id === selectedPhysicalModuleId)
+  $: selectedAtoRuns = atoModuleId
+    ? atoRuns.filter((run) => moduleIdMatches(run.module_id, atoModuleId))
     : atoRuns
   $: {
     const effectiveRuns = selectedAtoRuns.length ? selectedAtoRuns : atoRuns
@@ -2464,33 +2974,41 @@
   }
   $: tankUsageCutoff = Date.now() - activeCycleWindowHours * HOUR_IN_MS
   $: selectedTankUsageSamples = (() => {
-    if (!selectedPhysicalModuleId) return []
-    return tankUsageHistory.get(selectedPhysicalModuleId) ?? []
+    const key = normalizeModuleId(atoModuleId)
+    if (!key) return []
+    return tankUsageHistory.get(key) ?? []
+  })()
+  $: selectedAtoLevelSamples = (() => {
+    if (atoModuleId) {
+      for (const [moduleId, samples] of atoLevelHistory.entries()) {
+        if (!moduleIdMatches(moduleId, atoModuleId)) continue
+        return samples ?? []
+      }
+    }
+    for (const samples of atoLevelHistory.values()) {
+      if (Array.isArray(samples) && samples.length) return samples
+    }
+    return []
   })()
   $: atoChartPoints = (() => {
-    if (!selectedTankUsageSamples.length) return []
-    let lastValue = null
-    return [...selectedTankUsageSamples]
-      .filter((sample) => sample.timestamp >= tankUsageCutoff)
-      .sort((a, b) => a.timestamp - b.timestamp)
-      .map((sample) => {
-        const resetDetected = lastValue != null && sample.usedMl + TANK_RESET_THRESHOLD_ML < lastValue
-        lastValue = sample.usedMl
-        return {
-          ts: sample.timestamp,
-          used: sample.usedMl,
-          reset: resetDetected,
-        }
-      })
+    const fallbackRuns = selectedAtoRuns.length ? selectedAtoRuns : atoRuns
+    return buildAtoUsageSeries({
+      tankSamples: selectedTankUsageSamples,
+      levelSamples: selectedAtoLevelSamples,
+      fallbackRuns,
+      cutoff: tankUsageCutoff,
+      resetThreshold: TANK_RESET_THRESHOLD_ML,
+      runtimeMsToMilliliters,
+    })
   })()
   $: atoChartMaxValue = (() => {
     if (!atoChartPoints.length) return 0
     const maxUsed = Math.max(...atoChartPoints.map((point) => point.used), 0)
     const estimatedCapacity =
       coalesceNumber(
-        selectedModule?.ato?.tank_capacity_ml,
-        selectedModule?.configPayload?.ato?.tank_capacity_ml,
-        selectedModule?.config_payload?.ato?.tank_capacity_ml,
+        atoModule?.ato?.tank_capacity_ml ?? selectedModule?.ato?.tank_capacity_ml,
+        atoModule?.configPayload?.ato?.tank_capacity_ml ?? selectedModule?.configPayload?.ato?.tank_capacity_ml,
+        atoModule?.config_payload?.ato?.tank_capacity_ml ?? selectedModule?.config_payload?.ato?.tank_capacity_ml,
         DEFAULT_TANK_CAPACITY_ML
       ) ?? DEFAULT_TANK_CAPACITY_ML
     return Math.max(maxUsed, estimatedCapacity)
@@ -2498,7 +3016,7 @@
   $: atoYAxisMax = atoChartMaxValue ? atoChartMaxValue * 1.05 : undefined
   $: atoResetMarkers = atoChartPoints.filter((point) => point.reset)
   $: atoActivationMarkers = (() => {
-    if (!selectedPhysicalModuleId) return []
+    if (!atoModuleId) return []
     return selectedAtoRuns
       .map((run) => ({ ts: new Date(run.recorded_at).getTime() }))
       .filter((marker) => marker.ts >= tankUsageCutoff)
@@ -2513,11 +3031,11 @@
           })),
           borderColor: 'rgba(95, 179, 255, 0.85)',
           backgroundColor: 'rgba(95, 179, 255, 0.15)',
-          borderWidth: 2,
+          borderWidth: 2.6,
           fill: false,
-          tension: 0.35,
-          pointRadius: 3,
-          pointHoverRadius: 4,
+          tension: 0.4,
+          pointRadius: 0,
+          pointHoverRadius: 2,
           pointBackgroundColor: '#5fb3ff',
           pointBorderColor: '#020710',
         },
@@ -2537,31 +3055,43 @@
         ),
       ]
     : []
-  $: selectedHeaterSamples = selectedPhysicalModuleId
-    ? heaterTelemetryHistory.get(selectedPhysicalModuleId) ?? []
-    : []
+  $: atoChartHasData = hasRenderableChartData(atoChartDatasets)
+  $: atoChartLoading = cycleHistoryLoading && !atoChartHasData
+  $: selectedHeaterSamples = (() => {
+    if (heaterModuleId) {
+      const direct = heaterTelemetryHistory.get(heaterModuleId)
+      if (Array.isArray(direct) && direct.length) return direct
+      for (const [moduleId, samples] of heaterTelemetryHistory.entries()) {
+        if (!moduleIdMatches(moduleId, heaterModuleId)) continue
+        return Array.isArray(samples) ? samples : []
+      }
+    }
+    if (primaryHeaterSamples.length) return primaryHeaterSamples
+    for (const samples of heaterTelemetryHistory.values()) {
+      if (Array.isArray(samples) && samples.length) return samples
+    }
+    return []
+  })()
   $: heaterSamplesInWindow = (() => {
     if (!selectedHeaterSamples.length) return []
     const cutoff = Date.now() - temperatureChartWindowMs
-    return selectedHeaterSamples.filter((sample) => sample.timestamp >= cutoff)
+    const inWindow = selectedHeaterSamples.filter((sample) => sample.timestamp >= cutoff)
+    return inWindow.length ? inWindow : selectedHeaterSamples.slice(-240)
   })()
-  $: temperatureSeries = buildTemperatureSeries(
-    heaterSamplesInWindow,
-    temperatureSetpointC,
-    heaterSetpointMinC,
-    heaterSetpointMaxC
-  )
+  $: temperatureSeries = buildTemperatureSeries(heaterSamplesInWindow)
   $: temperatureChartDatasets = temperatureSeries.datasets
   $: temperatureYAxisMin = temperatureSeries.yMin
   $: temperatureYAxisMax = temperatureSeries.yMax
+  $: temperatureChartHasData = hasRenderableChartData(temperatureChartDatasets)
+  $: temperatureChartLoading = loading && !temperatureChartHasData
   $: latestTemperatureSample = heaterSamplesInWindow.length
     ? heaterSamplesInWindow[heaterSamplesInWindow.length - 1]
     : null
-  $: temperatureChartMeta = buildTemperatureMeta(latestTemperatureSample, selectedModule)
+  $: temperatureChartMeta = buildTemperatureMeta(latestTemperatureSample, heaterModule ?? selectedModule)
   $: primaryHeaterSamples = (() => {
     if (!PRIMARY_HEATER_MODULE_ID) return []
     for (const [moduleId, samples] of heaterTelemetryHistory.entries()) {
-      if (normalizeModuleId(moduleId) !== PRIMARY_HEATER_MODULE_ID) continue
+      if (!matchesPrimaryHeaterModule(moduleId)) continue
       return Array.isArray(samples) ? samples : []
     }
     return []
@@ -2569,7 +3099,12 @@
   $: primaryHeaterSample = primaryHeaterSamples.length
     ? primaryHeaterSamples[primaryHeaterSamples.length - 1]
     : null
-  $: heroCurrentTempC = computeSampleAverageC(primaryHeaterSample)
+  $: heroTemperatureDisplay = (() => {
+    const heaterCard =
+      moduleCards.find((card) => isHeaterCard(card) && matchesPrimaryHeaterModule(card?.module_id)) ??
+      moduleCards.find((card) => isHeaterCard(card))
+    return formatThermometerReading(heaterCard?.heater_summary?.thermometers?.[0])
+  })()
   $: heroAverage3dTempC = (() => {
     if (!primaryHeaterSamples.length) return null
     const cutoff = Date.now() - HERO_AVERAGE_WINDOW_MS
@@ -2611,10 +3146,16 @@
     selectedModuleId = cardId
     purgeConfirming = false
     const targetCard = moduleCards.find((module) => (module.card_id ?? module.module_id) === cardId)
+    if (targetCard?.status === 'offline') {
+      controlsVisible = false
+      controlError = 'Module is offline and cannot receive commands.'
+      return
+    }
     if (targetCard) {
       const physicalTarget = hydratedModules.find((module) => module.module_id === getCardModuleId(targetCard))
       prefillControls(physicalTarget ?? targetCard)
     }
+    heaterControlSection = 'basic'
     controlsVisible = true
   }
 
@@ -2631,6 +3172,11 @@
       controlUpdateTimer = null
     }
     controlUpdatePending = false
+    heaterControlSection = 'basic'
+  }
+
+  const openHeaterControlSection = (section = 'basic') => {
+    heaterControlSection = section === 'alarms' ? 'alarms' : 'basic'
   }
 
   const setUsageChartWindow = (hours) => {
@@ -2650,6 +3196,7 @@
     const clamped = clampSetpointValue(Number(numeric.toFixed(1)))
     if (kind === 'target') {
       temperatureSetpointC = clamped
+      syncHeaterBandFromSettings({ center: clamped })
     } else if (kind === 'min') {
       heaterSetpointMinC = clamped
       if (heaterSetpointMaxC != null && heaterSetpointMinC > heaterSetpointMaxC) {
@@ -2698,6 +3245,79 @@
     handleSetpointInput(kind, next)
   }
 
+  const handleHysteresisInput = () => {
+    const normalized = clampHysteresisSpan(heaterHysteresisSpanC)
+    if (normalized == null) return
+    heaterHysteresisSpanC = normalized
+    syncHeaterBandFromSettings({ span: normalized })
+  }
+
+  const commitHysteresisChange = () => {
+    handleHysteresisInput()
+    scheduleControlUpdate()
+  }
+
+  const handleProbeToleranceInput = (eventOrValue) => {
+    const raw =
+      typeof eventOrValue === 'object' && eventOrValue?.target
+        ? eventOrValue.target.value
+        : eventOrValue ?? heaterProbeToleranceC
+    const normalized = clampProbeTolerance(raw ?? DEFAULT_PROBE_TOLERANCE_C)
+    if (normalized == null) return
+    heaterProbeToleranceC = normalized
+  }
+
+  const commitProbeToleranceChange = (eventOrValue) => {
+    handleProbeToleranceInput(eventOrValue)
+    scheduleControlUpdate()
+  }
+
+  const updateHeaterAlarmSetting = (key, eventOrValue) => {
+    const raw =
+      typeof eventOrValue === 'object' && eventOrValue?.target
+        ? eventOrValue.target.value
+        : eventOrValue
+
+    if (key === 'probe_timeout_s') {
+      const normalized = clampProbeTimeoutS(raw)
+      if (normalized == null) return false
+      heaterProbeTimeoutS = normalized
+      return true
+    }
+    if (key === 'runaway_delta_c') {
+      const normalized = clampRunawayDeltaC(raw)
+      if (normalized == null) return false
+      heaterRunawayDeltaC = normalized
+      return true
+    }
+    if (key === 'max_heater_on_min') {
+      const normalized = clampMaxHeaterOnMinutes(raw)
+      if (normalized == null) return false
+      heaterMaxOnMinutes = normalized
+      return true
+    }
+    if (key === 'stuck_relay_delta_c') {
+      const normalized = clampStuckRelayDeltaC(raw)
+      if (normalized == null) return false
+      heaterStuckRelayDeltaC = normalized
+      return true
+    }
+    if (key === 'stuck_relay_window_s') {
+      const normalized = clampStuckRelayWindowS(raw)
+      if (normalized == null) return false
+      heaterStuckRelayWindowS = normalized
+      return true
+    }
+    return false
+  }
+
+  const commitHeaterAlarmSetting = (key, eventOrValue) => {
+    const changed = updateHeaterAlarmSetting(key, eventOrValue)
+    if (changed) {
+      scheduleControlUpdate()
+    }
+  }
+
   const setCycleChartWindow = (hours) => {
     const normalized = Math.max(1, Math.min(hours, MAX_CYCLE_WINDOW_HOURS))
     if (cycleWindow === normalized) return
@@ -2720,12 +3340,20 @@
     if (motorRunTimeMs) payload.motor_run_time_ms = Number(motorRunTimeMs)
 
     const hasValue = (value) => value !== null && value !== undefined && value !== ''
-    if (hasValue(rollerSpeed)) payload.roller_speed = Number(rollerSpeed)
+    if (hasValue(rollerSpeed)) {
+      const normalizedSpeed = clampRollerSpeed(rollerSpeed)
+      if (normalizedSpeed != null) payload.roller_speed = normalizedSpeed
+    }
     if (hasValue(pumpTimeoutMs)) payload.pump_timeout_ms = Number(pumpTimeoutMs)
     if (hasValue(alarmChirpIntervalMs)) payload.alarm_chirp_interval_ms = Number(alarmChirpIntervalMs)
     if (hasValue(temperatureSetpointC)) payload.heater_setpoint_c = Number(temperatureSetpointC)
-    if (hasValue(heaterSetpointMinC)) payload.heater_setpoint_min_c = Number(heaterSetpointMinC)
-    if (hasValue(heaterSetpointMaxC)) payload.heater_setpoint_max_c = Number(heaterSetpointMaxC)
+    if (hasValue(heaterHysteresisSpanC)) payload.heater_hysteresis_span_c = Number(heaterHysteresisSpanC)
+    if (hasValue(heaterProbeToleranceC)) payload.probe_tolerance_c = Number(heaterProbeToleranceC)
+    if (hasValue(heaterProbeTimeoutS)) payload.probe_timeout_s = Number(heaterProbeTimeoutS)
+    if (hasValue(heaterRunawayDeltaC)) payload.runaway_delta_c = Number(heaterRunawayDeltaC)
+    if (hasValue(heaterMaxOnMinutes)) payload.max_heater_on_min = Number(heaterMaxOnMinutes)
+    if (hasValue(heaterStuckRelayDeltaC)) payload.stuck_relay_delta_c = Number(heaterStuckRelayDeltaC)
+    if (hasValue(heaterStuckRelayWindowS)) payload.stuck_relay_window_s = Number(heaterStuckRelayWindowS)
 
     if (Object.keys(payload).length === 0) {
       return
@@ -2998,7 +3626,6 @@
     try {
       await updateModuleControls(selectedPhysicalModuleId, { ato_tank_refill: 1 })
       controlMessage = 'Tank reset to full.'
-      markTankReset(selectedPhysicalModuleId, Date.now())
       await refresh()
     } catch (err) {
       controlError = err.message ?? 'Failed to mark tank as refilled.'
@@ -3064,7 +3691,8 @@
   <title>Pickle Reef Console</title>
 </svelte:head>
 
-<main class="layout dashboard-view">
+<main class="layout dashboard-view" class:layout--compact-embed={isCompactEmbed}>
+  {#if !isCompactEmbed}
   <section class="hero">
     <div class="hero-copy">
       <h1 aria-label="Pickle Reef controller console">PICKLE REEF</h1>
@@ -3113,11 +3741,13 @@
       </div>
     </div>
     <div class="hero-logo">
-      <img src="/picklereeflogo.png" alt="Pickle Reef logo" />
+      <img src={`${import.meta.env.BASE_URL}picklereeflogo.png`} alt="Pickle Reef logo" />
     </div>
     <div class="glow"></div>
   </section>
+  {/if}
 
+  {#if !isCompactEmbed}
   <section class="grid metrics">
     {#each Object.keys(metricCopy) as metric}
       <article class="panel metric-card" class:metric-card--temperature={metric === 'temperature'}>
@@ -3129,7 +3759,7 @@
             {/if}
           </div>
           <span class={`metric-card__value ${metric === 'temperature' ? 'metric-card__value--xl' : ''}`}>
-            {formatValue(metric)}
+            {metric === 'temperature' ? heroTemperatureDisplay : formatValue(metric)}
           </span>
         </header>
         <footer class="metric-card__footer">
@@ -3154,8 +3784,10 @@
       </article>
     {/each}
   </section>
+  {/if}
 
-  <section class="grid modules">
+  <section class="grid modules" class:modules--compact-embed={isCompactEmbed}>
+    {#if !isCompactEmbed}
     <div class="panel module-panel" aria-label="Module overview">
       <header>
         <div>
@@ -3173,29 +3805,32 @@
               class:selected={(module.card_id ?? module.module_id) === selectedModuleId}
             >
               <div class="module-card__head">
-                <div>
+                <div class="module-card__identity">
                   <p class="module-label">
-                    {module.label}
-                    {#if module.module_type}
-                      <span class={`module-type-pill ${moduleTypeClassName(module.module_type)}`}>
-                        {module.module_type}
-                      </span>
-                    {/if}
-                    <span class="module-subsystem-pill">{module.badge_label}</span>
+                    {module.card_title ?? module.badge_label ?? module.label ?? module.module_id}
                   </p>
-                  <p class="module-meta">{module.module_id}</p>
+                  <p class="module-meta module-family">
+                    {module.card_subtitle ?? module.label ?? module.module_id}
+                  </p>
+                  <p class="module-meta module-id">{module.module_id}</p>
+                  <div class="module-pill-row">
+                    <span class="module-subsystem-pill">{module.badge_label}</span>
+                    <span class={`pill module-status-pill ${statusPalette[module.status] ?? ''}`}>
+                      {formatState(module.status)}
+                    </span>
+                  </div>
                 </div>
                 <div class="module-meta ip-meta">
                   IP {module.ip_address ?? '—'} · RSSI {module.rssi ?? '—'} dBm
                 </div>
                 <div class="module-card__actions">
-                  <span class="pill {statusPalette[module.status] ?? ''}">{formatState(module.status)}</span>
                   <button
                     type="button"
                     class="ghost small"
+                    disabled={module.status === 'offline'}
                     on:click={() => openControls(module.card_id ?? module.module_id)}
                   >
-                    Controls
+                    {module.status === 'offline' ? 'Offline' : 'Controls'}
                   </button>
                 </div>
               </div>
@@ -3219,9 +3854,9 @@
                     <small>{module.heater_summary?.heaterState?.description ?? 'Waiting for heater telemetry'}</small>
                   </div>
                   <div class="insight">
-                    <p>Duty / min</p>
+                    <p>Duty (1h)</p>
                     <strong>{formatDutyCycleLabel(module.heater_summary?.dutyPercent)}</strong>
-                    <small>Rolling 60-second average</small>
+                    <small>On-time over last rolling hour</small>
                   </div>
                 {:else if isRollerSubsystem(module.subsystem)}
                   <div class="insight">
@@ -3306,6 +3941,7 @@
         {/if}
       </ul>
     </div>
+    {/if}
 
     <div class="panel timeline" aria-label="Last telemetry readings">
       <header>
@@ -3316,23 +3952,88 @@
       {#if cycleHistoryError}
         <div class="banner warning">{cycleHistoryError}</div>
       {/if}
-      <ChartWidget
-        ariaLabel="Estimated filter media usage"
-        label="Usage window"
-        description={describeUsageWindow(usageChartWindowHours)}
-        buttons={usageWindowButtons}
-        activeValue={usageChartWindowHours}
-        on:select={(event) => setUsageChartWindow(event.detail)}
-      >
-        {#if !selectedPhysicalModuleId}
+      {#if shouldRenderChartInView('chart-temperature')}
+      <div class="chart-anchor" id="chart-temperature">
+        <ChartWidget
+          ariaLabel="Heater temperature history"
+          label="Heater Window"
+          description={describeUsageWindow(temperatureChartWindowHours)}
+          buttons={temperatureWindowButtons}
+          activeValue={temperatureChartWindowHours}
+          on:select={(event) => setTemperatureChartWindow(event.detail)}
+        >
+        {#if temperatureChartLoading}
           <div class="chart-widget__placeholder">
-            <p class="placeholder">Select a module to track filter usage.</p>
+            <p class="placeholder">Loading heater telemetry…</p>
           </div>
-        {:else if loading && usageChart.points.length === 0}
+        {:else if !temperatureChartHasData}
+          <div class="chart-widget__placeholder">
+            <p class="placeholder">
+              No heater telemetry captured in the last {formatUsageWindowShort(temperatureChartWindowHours)}.
+            </p>
+          </div>
+        {:else}
+          <LineChart
+            datasets={temperatureChartDatasets}
+            ariaLabel="Heater temperature chart"
+            yTitle="Temperature (°C)"
+            xTitle="Time"
+            xTickFormatter={formatCycleTimestamp}
+            tooltipFormatter={temperatureTooltipFormatter}
+            height={320}
+            fontSize={16}
+            fontWeight="600"
+            tickColor="rgba(255, 255, 255, 0.95)"
+            gridColor="rgba(255, 255, 255, 0.2)"
+            yBeginAtZero={false}
+            yMin={temperatureYAxisMin}
+            yMax={temperatureYAxisMax}
+            showLegend={true}
+          />
+        {/if}
+
+        <svelte:fragment slot="meta">
+          {#if temperatureChartMeta}
+            <div class="chart-meta temperature-meta">
+              <div>
+                <p>Last sample</p>
+                <strong>{formatTimestamp(temperatureChartMeta.timestamp)}</strong>
+              </div>
+              {#each temperatureChartMeta.readings as reading}
+                <div>
+                  <p>{reading.label}</p>
+                  <strong>{formatCelsiusValue(reading.value)}</strong>
+                </div>
+              {/each}
+              <div>
+                <p>Heater</p>
+                <strong class:active={temperatureChartMeta.heaterOn}>
+                  {temperatureChartMeta.heaterOn ? 'Heating' : 'Idle'}
+                </strong>
+                <small>{temperatureChartMeta.description || 'Awaiting heater telemetry'}</small>
+              </div>
+            </div>
+          {/if}
+        </svelte:fragment>
+        </ChartWidget>
+      </div>
+      {/if}
+
+      {#if shouldRenderChartInView('chart-filter')}
+      <div class="chart-anchor" id="chart-filter">
+        <ChartWidget
+          ariaLabel="Estimated filter media usage"
+          label="Filter Usage Window"
+          description={describeUsageWindow(usageChartWindowHours)}
+          buttons={usageWindowButtons}
+          activeValue={usageChartWindowHours}
+          on:select={(event) => setUsageChartWindow(event.detail)}
+        >
+        {#if usageChartLoading}
           <div class="chart-widget__placeholder">
             <p class="placeholder">Loading filter usage…</p>
           </div>
-        {:else if usageChart.points.length === 0 && usageActivationMarkers.length === 0}
+        {:else if !usageChartHasData}
           <div class="chart-widget__placeholder">
             <p class="placeholder">
               No filter movement detected in the last {formatUsageWindowShort(usageChartWindowHours)}.
@@ -3382,114 +4083,31 @@
             </div>
           {/if}
         </svelte:fragment>
-      </ChartWidget>
+        </ChartWidget>
+      </div>
+      {/if}
 
-      <ChartWidget
-        ariaLabel="Heater temperature history"
-        label="Heater window"
-        description={describeUsageWindow(temperatureChartWindowHours)}
-        buttons={temperatureWindowButtons}
-        activeValue={temperatureChartWindowHours}
-        on:select={(event) => setTemperatureChartWindow(event.detail)}
-      >
-        {#if !selectedPhysicalModuleId}
-          <div class="chart-widget__placeholder">
-            <p class="placeholder">Select a module to visualize heater telemetry.</p>
-          </div>
-        {:else if loading && !temperatureChartDatasets.length}
-          <div class="chart-widget__placeholder">
-            <p class="placeholder">Loading heater telemetry…</p>
-          </div>
-        {:else if !temperatureChartDatasets.length}
-          <div class="chart-widget__placeholder">
-            <p class="placeholder">
-              No heater telemetry captured in the last {formatUsageWindowShort(temperatureChartWindowHours)}.
-            </p>
-          </div>
-        {:else}
-          <LineChart
-            datasets={temperatureChartDatasets}
-            ariaLabel="Heater temperature chart"
-            yTitle="Temperature (°C)"
-            xTitle="Time"
-            xTickFormatter={formatCycleTimestamp}
-            tooltipFormatter={temperatureTooltipFormatter}
-            height={320}
-            fontSize={16}
-            fontWeight="600"
-            tickColor="rgba(255, 255, 255, 0.95)"
-            gridColor="rgba(255, 255, 255, 0.2)"
-            yBeginAtZero={false}
-            yMin={temperatureYAxisMin}
-            yMax={temperatureYAxisMax}
-            showLegend={true}
-          />
-        {/if}
-
-        <svelte:fragment slot="controls">
-          <label class="setpoint-control" for="temperature-setpoint">
-            <span>Setpoint</span>
-            <div class="setpoint-control__input">
-              <input
-                id="temperature-setpoint"
-                type="number"
-                min={HEATER_SETPOINT_MIN_BOUND_C}
-                max={HEATER_SETPOINT_MAX_BOUND_C}
-                step="0.1"
-                bind:value={temperatureSetpointC}
-                inputmode="decimal"
-                aria-label="Temperature setpoint"
-                on:input={(event) => handleSetpointInput('target', event)}
-              />
-              <span class="unit">°C</span>
-            </div>
-          </label>
-        </svelte:fragment>
-
-        <svelte:fragment slot="meta">
-          {#if temperatureChartMeta}
-            <div class="chart-meta temperature-meta">
-              <div>
-                <p>Last sample</p>
-                <strong>{formatTimestamp(temperatureChartMeta.timestamp)}</strong>
-              </div>
-              {#each temperatureChartMeta.readings as reading}
-                <div>
-                  <p>{reading.label}</p>
-                  <strong>{formatCelsiusValue(reading.value)}</strong>
-                </div>
-              {/each}
-              <div>
-                <p>Heater</p>
-                <strong class:active={temperatureChartMeta.heaterOn}>
-                  {temperatureChartMeta.heaterOn ? 'Heating' : 'Idle'}
-                </strong>
-                <small>{temperatureChartMeta.description || 'Awaiting heater telemetry'}</small>
-              </div>
-            </div>
-          {/if}
-        </svelte:fragment>
-      </ChartWidget>
-
-      <ChartWidget
-        ariaLabel="ATO cycles chart"
-        label="ATO window"
-        description={describeUsageWindow(activeCycleWindowHours)}
-        buttons={cycleWindowButtons}
-        activeValue={activeCycleWindowHours}
-        on:select={(event) => setCycleChartWindow(event.detail)}
-      >
+      {#if shouldRenderChartInView('chart-ato')}
+      <div class="chart-anchor" id="chart-ato">
+        <ChartWidget
+          ariaLabel="ATO cycles chart"
+          label="ATO Window"
+          description={describeUsageWindow(activeCycleWindowHours)}
+          buttons={cycleWindowButtons}
+          activeValue={activeCycleWindowHours}
+          on:select={(event) => setCycleChartWindow(event.detail)}
+        >
         <svelte:fragment slot="controls">
           <button type="button" class="refresh" on:click={refreshCycleHistory} aria-label="Refresh cycle data">
             ↻
           </button>
         </svelte:fragment>
 
-        {#if cycleHistoryLoading && !atoChartPoints.length}
+        {#if atoChartLoading}
           <div class="chart-widget__placeholder">
             <p class="placeholder">Loading ATO water usage…</p>
           </div>
-        {:else if !atoChartPoints.length}
+        {:else if !atoChartHasData}
           <div class="chart-widget__placeholder">
             <p class="placeholder">No ATO water usage in this window.</p>
           </div>
@@ -3539,8 +4157,11 @@
             </div>
           </div>
         </svelte:fragment>
-      </ChartWidget>
+        </ChartWidget>
+      </div>
+      {/if}
 
+      {#if !isCompactEmbed}
       <div class="timeline-divider"></div>
 
       <ul>
@@ -3555,6 +4176,7 @@
           </li>
         {/each}
       </ul>
+      {/if}
     </div>
 
   </section>
@@ -3655,6 +4277,24 @@
         <small class="control-hint">Changes sync automatically as you adjust settings.</small>
 
         {#if isHeaterView}
+          <div class="heater-control-nav">
+            <button
+              type="button"
+              class={heaterControlSection === 'basic' ? 'primary' : 'ghost'}
+              on:click={() => openHeaterControlSection('basic')}
+            >
+              Basic Controls
+            </button>
+            <button
+              type="button"
+              class={heaterControlSection === 'alarms' ? 'primary' : 'ghost'}
+              on:click={() => openHeaterControlSection('alarms')}
+            >
+              Alarm Controls
+            </button>
+          </div>
+
+          {#if heaterControlSection === 'basic'}
           <div class="form-group heater-setpoints">
             <div class="form-label-row">
               <p class="form-label">Setpoint band</p>
@@ -3662,7 +4302,7 @@
                 Target {temperatureSetpointC != null ? formatCelsiusValue(temperatureSetpointC) : '—'}
               </span>
             </div>
-            <small>Define the temperature window the heater firmware should hold before toggling output.</small>
+            <small>Define the center temperature the heater firmware targets before toggling output.</small>
             <div class="touch-input primary-touch-input">
               <button
                 type="button"
@@ -3695,79 +4335,130 @@
                 +
               </button>
             </div>
-            <div class="setpoint-range">
-              <label>
-                <span>Minimum</span>
-                <div class="touch-input">
-                  <button
-                    type="button"
-                    class="touch-input__button"
-                    aria-label="Decrease minimum setpoint"
-                    on:click={() => nudgeSetpointValue('min', -0.1)}
-                  >
-                    −
-                  </button>
-                  <div class="length-input">
-                    <input
-                      type="number"
-                      min={HEATER_SETPOINT_MIN_BOUND_C}
-                      max={HEATER_SETPOINT_MAX_BOUND_C}
-                      step="0.1"
-                      bind:value={heaterSetpointMinC}
-                      inputmode="decimal"
-                      placeholder="24.5"
-                      aria-label="Minimum setpoint"
-                      on:input={(event) => handleSetpointInput('min', event)}
-                    />
-                    <span>°C</span>
-                  </div>
-                  <button
-                    type="button"
-                    class="touch-input__button"
-                    aria-label="Increase minimum setpoint"
-                    on:click={() => nudgeSetpointValue('min', 0.1)}
-                  >
-                    +
-                  </button>
-                </div>
-              </label>
-              <label>
-                <span>Maximum</span>
-                <div class="touch-input">
-                  <button
-                    type="button"
-                    class="touch-input__button"
-                    aria-label="Decrease maximum setpoint"
-                    on:click={() => nudgeSetpointValue('max', -0.1)}
-                  >
-                    −
-                  </button>
-                  <div class="length-input">
-                    <input
-                      type="number"
-                      min={HEATER_SETPOINT_MIN_BOUND_C}
-                      max={HEATER_SETPOINT_MAX_BOUND_C}
-                      step="0.1"
-                      bind:value={heaterSetpointMaxC}
-                      inputmode="decimal"
-                      placeholder="25.5"
-                      aria-label="Maximum setpoint"
-                      on:input={(event) => handleSetpointInput('max', event)}
-                    />
-                    <span>°C</span>
-                  </div>
-                  <button
-                    type="button"
-                    class="touch-input__button"
-                    aria-label="Increase maximum setpoint"
-                    on:click={() => nudgeSetpointValue('max', 0.1)}
-                  >
-                    +
-                  </button>
-                </div>
-              </label>
+            <div class="setpoint-window">
+              <small>Heater cycles between</small>
+              <strong>
+                {formatCelsiusValue(heaterSetpointMinC)} – {formatCelsiusValue(heaterSetpointMaxC)}
+              </strong>
             </div>
           </div>
+
+          <div class="form-group heater-hysteresis">
+            <label for="heater-hysteresis">
+              Hysteresis width ({formatCelsiusValue(heaterHysteresisSpanC)})
+            </label>
+            <input
+              id="heater-hysteresis"
+              type="range"
+              min={HEATER_HYSTERESIS_MIN_C}
+              max={HEATER_HYSTERESIS_MAX_C}
+              step="0.05"
+              bind:value={heaterHysteresisSpanC}
+              on:input={handleHysteresisInput}
+              on:change={commitHysteresisChange}
+            />
+            <small>
+              Equivalent to ± {formatCelsiusValue(heaterHysteresisSpanC / 2)} around the setpoint.
+            </small>
+          </div>
+
+          <div class="form-group heater-tolerance">
+            <label for="probe-tolerance">
+              Probe tolerance ({formatCelsiusValue(heaterProbeToleranceC)})
+            </label>
+            <input
+              id="probe-tolerance"
+              type="range"
+              min={PROBE_TOLERANCE_MIN_C}
+              max={PROBE_TOLERANCE_MAX_C}
+              step="0.1"
+              bind:value={heaterProbeToleranceC}
+              on:input={handleProbeToleranceInput}
+              on:change={commitProbeToleranceChange}
+            />
+            <small>Trips the thermistor mismatch alarm when probes differ more than this delta.</small>
+          </div>
+          {:else}
+          <div class="form-group heater-alarm">
+            <label for="heater-probe-timeout">
+              Probe timeout ({heaterProbeTimeoutS}s)
+            </label>
+            <input
+              id="heater-probe-timeout"
+              type="range"
+              min={PROBE_TIMEOUT_MIN_S}
+              max={PROBE_TIMEOUT_MAX_S}
+              step="1"
+              bind:value={heaterProbeTimeoutS}
+              on:change={(event) => commitHeaterAlarmSetting('probe_timeout_s', event)}
+            />
+            <small>Seconds before probe sampling is considered stale.</small>
+          </div>
+
+          <div class="form-group heater-alarm">
+            <label for="heater-runaway-delta">
+              Runaway delta ({formatCelsiusValue(heaterRunawayDeltaC)})
+            </label>
+            <input
+              id="heater-runaway-delta"
+              type="range"
+              min={RUNAWAY_DELTA_MIN_C}
+              max={RUNAWAY_DELTA_MAX_C}
+              step="0.1"
+              bind:value={heaterRunawayDeltaC}
+              on:change={(event) => commitHeaterAlarmSetting('runaway_delta_c', event)}
+            />
+            <small>Allowed overshoot before runaway protection alarms.</small>
+          </div>
+
+          <div class="form-group heater-alarm">
+            <label for="heater-max-on-minutes">
+              Max heater on-time ({heaterMaxOnMinutes} min)
+            </label>
+            <input
+              id="heater-max-on-minutes"
+              type="range"
+              min={MAX_HEATER_ON_MIN_MIN}
+              max={MAX_HEATER_ON_MIN_MAX}
+              step="1"
+              bind:value={heaterMaxOnMinutes}
+              on:change={(event) => commitHeaterAlarmSetting('max_heater_on_min', event)}
+            />
+            <small>Maximum continuous heater runtime before safety timeout.</small>
+          </div>
+
+          <div class="form-group heater-alarm">
+            <label for="heater-stuck-relay-delta">
+              Stuck relay delta ({formatCelsiusValue(heaterStuckRelayDeltaC)})
+            </label>
+            <input
+              id="heater-stuck-relay-delta"
+              type="range"
+              min={STUCK_RELAY_DELTA_MIN_C}
+              max={STUCK_RELAY_DELTA_MAX_C}
+              step="0.1"
+              bind:value={heaterStuckRelayDeltaC}
+              on:change={(event) => commitHeaterAlarmSetting('stuck_relay_delta_c', event)}
+            />
+            <small>Expected rise threshold used to detect relay-stuck behavior.</small>
+          </div>
+
+          <div class="form-group heater-alarm">
+            <label for="heater-stuck-relay-window">
+              Stuck relay window ({heaterStuckRelayWindowS}s)
+            </label>
+            <input
+              id="heater-stuck-relay-window"
+              type="range"
+              min={STUCK_RELAY_WINDOW_MIN_S}
+              max={STUCK_RELAY_WINDOW_MAX_S}
+              step="5"
+              bind:value={heaterStuckRelayWindowS}
+              on:change={(event) => commitHeaterAlarmSetting('stuck_relay_window_s', event)}
+            />
+            <small>Observation period used by relay fault detection.</small>
+          </div>
+          {/if}
         {/if}
 
         {#if isAtoView}
@@ -3871,8 +4562,8 @@
             <input
               id="roller-speed"
               type="range"
-              min="50"
-              max="255"
+              min={ROLLER_SPEED_MIN}
+              max={ROLLER_SPEED_MAX}
               step="1"
               bind:value={rollerSpeed}
               on:change={scheduleControlUpdate}
@@ -4193,10 +4884,16 @@
         <button type="button" class="ghost" on:click={focusAlarmModule}>
           Inspect module
         </button>
+        <button type="button" class="ghost" on:click={snoozeActiveAlarm} disabled={alarmActionBusy}>
+          {alarmActionBusy ? 'Snoozing…' : 'Snooze alarm'}
+        </button>
         <button type="button" class="primary" on:click={acknowledgeAlarm}>
           Acknowledge alarm
         </button>
       </div>
+      {#if alarmActionError}
+        <div class="banner warning">{alarmActionError}</div>
+      {/if}
     </div>
   </div>
 {/if}

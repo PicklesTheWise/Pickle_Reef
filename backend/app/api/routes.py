@@ -13,6 +13,8 @@ from ..schemas.module import (
 )
 from ..schemas.cycle import CycleLog
 from ..services.module_control import apply_module_controls
+from ..services.connection_manager import manager
+from ..services.module_snapshot import list_module_snapshots
 from ..services.module_status import (
     list_module_statuses,
     purge_module_records,
@@ -25,12 +27,19 @@ from ..services.telemetry_store import (
 )
 from ..services.cycle_log import get_cycle_logs_since
 from ..services.spool_usage import get_spool_usage_entries
-from ..services.ws_trace import get_ws_trace, clear_ws_trace
+from ..services.ws_trace import (
+    get_ws_trace,
+    clear_ws_trace,
+    list_heater_history,
+    list_spool_history_from_trace,
+    list_ato_history_from_trace,
+)
 
 router = APIRouter(prefix="/api", tags=["telemetry"])
 MAX_CYCLE_HISTORY_HOURS = 365 * 24
 MAX_DECLARED_SUBSYSTEMS = 8
 ALLOWED_SUBSYSTEM_KINDS = {"roller", "ato"}
+PUMP_CYCLE_PREFIXES = ("pump", "ato")
 CATEGORY_KIND_MAP = {
     "filter": "roller",
     "roller": "roller",
@@ -92,6 +101,7 @@ async def list_modules():
     response: list[ModuleStatusRead] = []
     for module in modules:
         hydrated = ModuleStatusRead.model_validate(module)
+        hydrated.status = "online" if manager.is_connected(hydrated.module_id) else "offline"
         hydrated.module_type = _infer_module_type(module)
         hydrated.spool_state = _merge_spool_state(module)
         hydrated.subsystems = _derive_module_subsystems(module)
@@ -107,6 +117,21 @@ async def upsert_module(
     data = payload.model_dump(exclude_unset=True)
     data["last_seen"] = data.get("last_seen") or datetime.utcnow()
     return await upsert_module_metadata(module_id, data)
+
+
+@router.get("/modules/{module_id}/snapshots")
+async def module_snapshots(module_id: str, limit: int = 100, window_hours: int | None = None):
+    clamped_limit = max(1, min(limit, 1000))
+    snapshots = await list_module_snapshots(module_id, limit=clamped_limit, window_hours=window_hours)
+    return [
+        {
+            "id": snapshot.id,
+            "module_id": snapshot.module_id,
+            "recorded_at": snapshot.recorded_at.isoformat(),
+            "payload": snapshot.payload,
+        }
+        for snapshot in snapshots
+    ]
 
 
 @router.get("/health")
@@ -133,7 +158,7 @@ async def cycle_history(window_hours: int = 24):
 
     clamped_window = max(1, min(window_hours, MAX_CYCLE_HISTORY_HOURS))
     since = datetime.utcnow() - timedelta(hours=clamped_window)
-    logs = sorted(get_cycle_logs_since(since), key=lambda entry: entry.recorded_at)
+    logs = await get_cycle_logs_since(since)
 
     def serialize(log: CycleLog) -> dict:
         return {
@@ -159,7 +184,7 @@ async def cycle_history(window_hours: int = 24):
         }
 
     roller_logs = [log for log in logs if log.cycle_type and log.cycle_type.startswith("roller")]
-    pump_logs = [log for log in logs if log.cycle_type and log.cycle_type.startswith("pump")]
+    pump_logs = [log for log in logs if _is_pump_cycle(log)]
 
     roller_stats = summarize(roller_logs)
     ato_stats = summarize(pump_logs)
@@ -182,7 +207,7 @@ async def spool_usage_history(
 ):
     clamped_window = max(1, min(window_hours, 24 * 90))
     since = datetime.utcnow() - timedelta(hours=clamped_window)
-    entries = get_spool_usage_entries(
+    entries = await get_spool_usage_entries(
         module_id=module_id,
         since=since,
         limit=max(1, limit) if limit else None,
@@ -198,6 +223,33 @@ async def spool_usage_history(
         }
         for entry in entries
     ]
+
+
+@router.get("/temperature/history")
+async def temperature_history(
+    window_minutes: int = 60,
+    module_id: str | None = None,
+    limit: int = 720,
+):
+    return list_heater_history(window_minutes=window_minutes, module_id=module_id, limit=limit)
+
+
+@router.get("/spool/history-from-trace")
+async def spool_history_from_trace(
+    window_hours: int = 24,
+    module_id: str | None = None,
+    limit: int = 2000,
+):
+    return list_spool_history_from_trace(window_hours=window_hours, module_id=module_id, limit=limit)
+
+
+@router.get("/ato/history-from-trace")
+async def ato_history_from_trace(
+    window_hours: int = 24,
+    module_id: str | None = None,
+    limit: int = 2000,
+):
+    return list_ato_history_from_trace(window_hours=window_hours, module_id=module_id, limit=limit)
 
 
 @router.get("/debug/ws-trace")
@@ -231,6 +283,11 @@ def _derive_module_subsystems(module: ModuleStatus) -> list[ModuleSubsystemDefin
     if inferred:
         return inferred
     return [_build_default_subsystem(payload) for payload in DEFAULT_SUBSYSTEM_PAYLOADS]
+
+
+def _is_pump_cycle(log: CycleLog) -> bool:
+    cycle_type = (log.cycle_type or "").lower()
+    return any(cycle_type.startswith(prefix) for prefix in PUMP_CYCLE_PREFIXES)
 
 
 def _infer_module_type(module: ModuleStatus) -> str:

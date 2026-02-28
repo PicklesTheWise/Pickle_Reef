@@ -11,6 +11,7 @@ services:
       MQTT_PORT: 1883
       MQTT_TOPIC_PREFIX: pickle-reef
       WS_TRACE: "1"
+      WS_TRACE_DB_PATH: /app/data/ws_trace.db
     volumes:
       - ./backend/app:/app/app
       - ./backend/data:/app/data
