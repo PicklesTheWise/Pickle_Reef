@@ -33,7 +33,15 @@ def _build_command_envelope(module_id: str, command: str, parameters: dict | Non
 
 
 def _build_set_parameter_command(module_id: str, param: str, value) -> dict:
-    return _build_command_envelope(module_id, "set_parameter", {"param": param, "value": value})
+    return _build_command_envelope(
+        module_id,
+        "set_parameter",
+        {
+            "name": param,
+            "param": param,
+            "value": value,
+        },
+    )
 
 
 async def apply_module_controls(module_id: str, request: ModuleControlRequest) -> dict[str, int]:
@@ -114,6 +122,28 @@ async def apply_module_controls(module_id: str, request: ModuleControlRequest) -
 
     if request.probe_tolerance_c is not None:
         commands.append(_build_set_parameter_command(module_id, "probe_tolerance_c", request.probe_tolerance_c))
+
+    if request.probe_timeout_s is not None:
+        commands.append(_build_set_parameter_command(module_id, "probe_timeout_s", request.probe_timeout_s))
+
+    if request.runaway_delta_c is not None:
+        commands.append(_build_set_parameter_command(module_id, "runaway_delta_c", request.runaway_delta_c))
+
+    if request.max_heater_on_min is not None:
+        commands.append(_build_set_parameter_command(module_id, "max_heater_on_min", request.max_heater_on_min))
+
+    if request.stuck_relay_delta_c is not None:
+        commands.append(
+            _build_set_parameter_command(module_id, "stuck_relay_delta_c", request.stuck_relay_delta_c)
+        )
+
+    if request.stuck_relay_window_s is not None:
+        commands.append(
+            _build_set_parameter_command(module_id, "stuck_relay_window_s", request.stuck_relay_window_s)
+        )
+
+    if request.alarm_snooze:
+        commands.append(_build_command_envelope(module_id, "alarm_snooze"))
 
     if request.heater_setpoint_min_c is not None:
         commands.append(_build_set_parameter_command(module_id, "heater_setpoint_min_c", request.heater_setpoint_min_c))

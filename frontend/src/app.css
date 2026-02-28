@@ -56,6 +56,39 @@ body {
   padding: 2.5rem clamp(1.25rem, 4vw, 3rem) 4rem;
 }
 
+.layout.layout--compact-embed {
+  min-height: 100vh;
+  gap: 0.75rem;
+  padding: 0.75rem;
+}
+
+.layout.layout--compact-embed .modules.modules--compact-embed {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.layout.layout--compact-embed .timeline {
+  padding: 1rem;
+  min-height: calc(100vh - 1.5rem);
+}
+
+.layout.layout--compact-embed .timeline header,
+.layout.layout--compact-embed .timeline .timeline-divider,
+.layout.layout--compact-embed .timeline ul {
+  display: none;
+}
+
+.layout.layout--compact-embed .chart-widget {
+  gap: 0.55rem;
+}
+
+.layout.layout--compact-embed .chart-widget__body {
+  min-height: 300px;
+}
+
+.layout.layout--compact-embed .chart-meta {
+  margin-top: 0.6rem;
+}
+
 .hero {
   display: flex;
   flex-wrap: wrap;
@@ -343,6 +376,7 @@ body {
   flex: 1;
   align-items: stretch;
   position: relative;
+  overflow: hidden;
 }
 
 .metric-card--temperature .metric-card__header > div {
@@ -351,19 +385,30 @@ body {
 }
 
 .metric-card--temperature .metric-card__value--xl {
-  position: absolute;
-  inset: 0;
+  position: static;
   display: flex;
-  align-items: center;
+  align-items: flex-end;
   justify-content: flex-end;
-  height: 100%;
-  width: 100%;
-  text-align: center;
-  font-size: clamp(3.6rem, 8.6vw, 6rem);
-  line-height: 0.9;
+  height: auto;
+  width: auto;
+  max-width: 100%;
+  margin-left: auto;
+  text-align: right;
+  font-size: clamp(2.2rem, 6.4vw, 4rem);
+  line-height: 0.95;
   z-index: 1;
-  padding-right: 1rem;
-  transform: translateY(30px);
+  padding-right: 0;
+  transform: none;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+@media (max-width: 900px) {
+  .metric-card--temperature .metric-card__value--xl {
+    font-size: clamp(1.95rem, 9vw, 3.1rem);
+    line-height: 1;
+  }
 }
 
 .metric-card__footer p {
@@ -583,8 +628,26 @@ body {
   background: rgba(255, 255, 255, 0.02);
 }
 
+.heater-control-nav {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.6rem;
+}
+
+.heater-control-nav button {
+  width: 100%;
+}
+
+.form-group.heater-alarm {
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 1rem;
+  padding: 1rem;
+  background: rgba(255, 255, 255, 0.02);
+}
+
 .form-group.heater-hysteresis input[type='range'],
-.form-group.heater-tolerance input[type='range'] {
+.form-group.heater-tolerance input[type='range'],
+.form-group.heater-alarm input[type='range'] {
   appearance: none;
   height: 6px;
   border-radius: 999px;
@@ -593,14 +656,16 @@ body {
 }
 
 .form-group.heater-hysteresis input[type='range']::-webkit-slider-runnable-track,
-.form-group.heater-tolerance input[type='range']::-webkit-slider-runnable-track {
+.form-group.heater-tolerance input[type='range']::-webkit-slider-runnable-track,
+.form-group.heater-alarm input[type='range']::-webkit-slider-runnable-track {
   height: 6px;
   border-radius: 999px;
   background: rgba(255, 255, 255, 0.15);
 }
 
 .form-group.heater-hysteresis input[type='range']::-moz-range-track,
-.form-group.heater-tolerance input[type='range']::-moz-range-track {
+.form-group.heater-tolerance input[type='range']::-moz-range-track,
+.form-group.heater-alarm input[type='range']::-moz-range-track {
   height: 6px;
   border-radius: 999px;
   background: rgba(255, 255, 255, 0.15);
@@ -608,7 +673,8 @@ body {
 }
 
 .form-group.heater-hysteresis input[type='range']::-webkit-slider-thumb,
-.form-group.heater-tolerance input[type='range']::-webkit-slider-thumb {
+.form-group.heater-tolerance input[type='range']::-webkit-slider-thumb,
+.form-group.heater-alarm input[type='range']::-webkit-slider-thumb {
   appearance: none;
   width: 18px;
   height: 18px;
@@ -619,7 +685,8 @@ body {
 }
 
 .form-group.heater-hysteresis input[type='range']::-moz-range-thumb,
-.form-group.heater-tolerance input[type='range']::-moz-range-thumb {
+.form-group.heater-tolerance input[type='range']::-moz-range-thumb,
+.form-group.heater-alarm input[type='range']::-moz-range-thumb {
   width: 18px;
   height: 18px;
   border-radius: 50%;
@@ -629,7 +696,8 @@ body {
 }
 
 .form-group.heater-hysteresis small,
-.form-group.heater-tolerance small {
+.form-group.heater-tolerance small,
+.form-group.heater-alarm small {
   margin-top: 0.35rem;
 }
 
@@ -906,43 +974,6 @@ button.danger:disabled {
   cursor: pointer;
   line-height: 1.6rem;
   text-align: center;
-}
-
-.chart-widget__controls .setpoint-control {
-  display: flex;
-  align-items: center;
-  gap: 0.5rem;
-  color: var(--text-muted);
-  font-size: 0.8rem;
-}
-
-.chart-widget__controls .setpoint-control__input {
-  display: inline-flex;
-  align-items: center;
-  gap: 0.25rem;
-  border-radius: 999px;
-  border: 1px solid rgba(255, 255, 255, 0.25);
-  background: rgba(255, 255, 255, 0.05);
-  padding: 0.1rem 0.4rem 0.1rem 0.6rem;
-}
-
-.chart-widget__controls .setpoint-control input {
-  width: 4rem;
-  border: none;
-  background: transparent;
-  color: #f8fbff;
-  font-size: 0.85rem;
-  font-weight: 600;
-  text-align: right;
-}
-
-.chart-widget__controls .setpoint-control input:focus {
-  outline: none;
-}
-
-.chart-widget__controls .setpoint-control .unit {
-  font-size: 0.75rem;
-  color: var(--text-muted);
 }
 
 .window-buttons {

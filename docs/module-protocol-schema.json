@@ -1,0 +1,412 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://picklereef.dev/schemas/module-protocol.schema.json",
+  "title": "ReefNet Module Protocol",
+  "description": "Canonical message contract for module ↔ platform communication.",
+  "type": "object",
+  "required": [
+    "protocol",
+    "module_id",
+    "type",
+    "payload"
+  ],
+  "properties": {
+    "protocol": {
+      "type": "string",
+      "const": "reefnet.v1",
+      "description": "Protocol version identifier."
+    },
+    "module_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9._:-]{1,64}$",
+      "description": "Stable slug for the originating module (MAC-derived preferred)."
+    },
+    "submodule_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9._:-]{1,48}$",
+      "description": "Optional component scope within the parent module (e.g., Filter, ATO)."
+    },
+    "message_id": {
+      "type": "string",
+      "description": "Unique identifier supplied by the sender for tracing/acks."
+    },
+    "sent_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "UTC timestamp when the message left the module."
+    },
+    "received_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "UTC timestamp when the platform ingested the frame (server populated)."
+    },
+    "type": {
+      "type": "string",
+      "enum": [
+        "status",
+        "alarm",
+        "control"
+      ],
+      "description": "Message family."
+    },
+    "payload": {
+      "type": "object",
+      "description": "Body content; structure determined by message type."
+    },
+    "meta": {
+      "type": "object",
+      "description": "Transport-specific metadata (optional).",
+      "additionalProperties": true
+    }
+  },
+  "additionalProperties": false,
+  "allOf": [
+    {
+      "if": { "properties": { "type": { "const": "status" } }, "required": ["type"] },
+      "then": { "properties": { "payload": { "$ref": "#/$defs/StatusPayload" } } }
+    },
+    {
+      "if": { "properties": { "type": { "const": "alarm" } }, "required": ["type"] },
+      "then": { "properties": { "payload": { "$ref": "#/$defs/AlarmPayload" } } }
+    },
+    {
+      "if": { "properties": { "type": { "const": "control" } }, "required": ["type"] },
+      "then": { "properties": { "payload": { "$ref": "#/$defs/ControlPayload" } } }
+    }
+  ],
+  "$defs": {
+    "StatusPayload": {
+      "type": "object",
+      "description": "Real-time telemetry describing the module's current state.",
+      "properties": {
+        "uptime_s": { "type": "integer", "minimum": 0 },
+        "firmware": { "$ref": "#/$defs/FirmwareInfo" },
+        "network": { "$ref": "#/$defs/NetworkInfo" },
+        "motor": { "$ref": "#/$defs/MotorSnapshot" },
+        "spool": { "$ref": "#/$defs/SpoolSnapshot" },
+        "ato": { "$ref": "#/$defs/AtoSnapshot" },
+        "environment": { "$ref": "#/$defs/EnvironmentSnapshot" },
+        "subsystems": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/SubsystemSnapshot" },
+          "maxItems": 8
+        },
+        "last_error": {
+          "type": "string",
+          "description": "Optional free-form diagnostic string."
+        }
+      },
+      "additionalProperties": true
+    },
+    "AlarmPayload": {
+      "type": "object",
+      "description": "Fault or warning requiring user attention.",
+      "required": [
+        "severity",
+        "code",
+        "message",
+        "active",
+        "triggered_at"
+      ],
+      "properties": {
+        "severity": {
+          "type": "string",
+          "enum": ["info", "warning", "critical"]
+        },
+        "code": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "message": { "type": "string", "maxLength": 256 },
+        "active": { "type": "boolean" },
+        "triggered_at": { "type": "string", "format": "date-time" },
+        "cleared_at": { "type": "string", "format": "date-time" },
+        "meta": {
+          "type": "object",
+          "description": "Structured context for the alarm (timeouts, sensor values, etc.).",
+          "additionalProperties": true
+        }
+      },
+      "additionalProperties": false
+    },
+    "ControlPayload": {
+      "type": "object",
+      "description": "UI or automation command sent to a module.",
+      "required": ["command"],
+      "properties": {
+        "command": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "description": "Known commands include set_parameter, set_ato_mode, spool_reset, spool_calibrate_start, spool_calibrate_finish, spool_calibrate_cancel, ato_tank_refill, alarm_snooze."
+        },
+        "parameters": {
+          "type": "object",
+          "description": "Command-specific arguments (speed, duration, thresholds, etc.).",
+          "additionalProperties": true
+        },
+        "request_id": {
+          "type": "string",
+          "description": "Client-supplied identifier for correlating acknowledgements."
+        },
+        "requested_at": { "type": "string", "format": "date-time" },
+        "expires_at": { "type": "string", "format": "date-time" }
+      },
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": { "command": { "const": "set_parameter" } },
+            "required": ["command"]
+          },
+          "then": {
+            "required": ["parameters"],
+            "properties": {
+              "parameters": { "$ref": "#/$defs/SetParameterPayload" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "command": { "const": "set_ato_mode" } },
+            "required": ["command"]
+          },
+          "then": {
+            "required": ["parameters"],
+            "properties": {
+              "parameters": {
+                "type": "object",
+                "required": ["mode"],
+                "properties": {
+                  "mode": {
+                    "type": "integer",
+                    "enum": [0, 1, 2],
+                    "description": "ATO mode mapping: 0=auto, 1=manual, 2=paused"
+                  }
+                },
+                "additionalProperties": true
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "command": { "const": "spool_calibrate_finish" } },
+            "required": ["command"]
+          },
+          "then": {
+            "required": ["parameters"],
+            "properties": {
+              "parameters": {
+                "type": "object",
+                "required": ["roll_length_mm"],
+                "properties": {
+                  "roll_length_mm": {
+                    "type": "number",
+                    "minimum": 0,
+                    "description": "Calibration completion length in millimetres; 0 means reuse stored value."
+                  }
+                },
+                "additionalProperties": true
+              }
+            }
+          }
+        }
+      ]
+    },
+    "SetParameterPayload": {
+      "type": "object",
+      "description": "Generic runtime parameter write. For compatibility, modules may read either parameters.name (new) or parameters.param (legacy). Sending both is recommended.",
+      "required": ["value"],
+      "properties": {
+        "name": {
+          "type": "string",
+          "enum": [
+            "motor_speed",
+            "motor_max_speed",
+            "motor_runtime",
+            "run_time_ms",
+            "pump_speed",
+            "pump_timeout_ms",
+            "ramp_up",
+            "ramp_down",
+            "chirp_enabled",
+            "alarm_chirp_interval_ms",
+            "ato_mode",
+            "ato_tank_capacity_ml",
+            "ato_tank_level_ml",
+            "ato_tank_refill",
+            "spool_reset",
+            "spool_length_mm",
+            "spool_media_thickness_um",
+            "spool_core_diameter_mm",
+            "spool_calibrate_start",
+            "spool_calibrate_finish",
+            "spool_calibrate_cancel"
+          ]
+        },
+        "param": {
+          "type": "string",
+          "enum": [
+            "motor_speed",
+            "motor_max_speed",
+            "motor_runtime",
+            "run_time_ms",
+            "pump_speed",
+            "pump_timeout_ms",
+            "ramp_up",
+            "ramp_down",
+            "chirp_enabled",
+            "alarm_chirp_interval_ms",
+            "ato_mode",
+            "ato_tank_capacity_ml",
+            "ato_tank_level_ml",
+            "ato_tank_refill",
+            "spool_reset",
+            "spool_length_mm",
+            "spool_media_thickness_um",
+            "spool_core_diameter_mm",
+            "spool_calibrate_start",
+            "spool_calibrate_finish",
+            "spool_calibrate_cancel"
+          ]
+        },
+        "value": {
+          "description": "Parameter value; numeric/boolean/string depending on key.",
+          "type": ["number", "integer", "string", "boolean"]
+        }
+      },
+      "anyOf": [
+        { "required": ["name"] },
+        { "required": ["param"] }
+      ],
+      "additionalProperties": true
+    },
+    "MotorSnapshot": {
+      "type": "object",
+      "description": "Roller motor runtime state used by dashboard controls.",
+      "properties": {
+        "state": {
+          "type": "string",
+          "enum": ["stopped", "ramping_up", "running", "ramping_down"]
+        },
+        "mode": { "type": "string", "enum": ["auto", "manual"] },
+        "speed": { "type": "number", "minimum": 0, "maximum": 255 },
+        "max_speed": { "type": "number", "minimum": 0, "maximum": 255 },
+        "runtime_ms": { "type": "number", "minimum": 0 },
+        "run_time_ms": { "type": "number", "minimum": 0 }
+      },
+      "additionalProperties": true
+    },
+    "FirmwareInfo": {
+      "type": "object",
+      "properties": {
+        "version": { "type": "string", "maxLength": 32 },
+        "build": { "type": "string", "maxLength": 48 },
+        "hardware_revision": { "type": "string", "maxLength": 16 }
+      },
+      "additionalProperties": false
+    },
+    "NetworkInfo": {
+      "type": "object",
+      "properties": {
+        "ip": { "type": "string", "format": "ipv4" },
+        "mac": { "type": "string", "pattern": "^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$" },
+        "rssi_dbm": { "type": "integer", "maximum": 0 },
+        "ssid": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "SpoolSnapshot": {
+      "type": "object",
+      "properties": {
+        "full_edges": { "type": "number", "minimum": 0 },
+        "used_edges": { "type": "number", "minimum": 0 },
+        "remaining_edges": { "type": "number", "minimum": 0 },
+        "total_length_mm": { "type": "number", "minimum": 0 },
+        "percent_remaining": { "type": "number", "minimum": 0, "maximum": 100 },
+        "activations": { "type": "integer", "minimum": 0 },
+        "last_activation_at": { "type": "string", "format": "date-time" }
+      },
+      "additionalProperties": false
+    },
+    "AtoSnapshot": {
+      "type": "object",
+      "properties": {
+        "pump_running": { "type": "boolean" },
+        "manual_mode": { "type": "boolean" },
+        "timeout_alarm": { "type": "boolean" },
+        "activations": { "type": "integer", "minimum": 0 },
+        "reservoir": { "$ref": "#/$defs/ReservoirSnapshot" }
+      },
+      "additionalProperties": false
+    },
+    "ReservoirSnapshot": {
+      "type": "object",
+      "properties": {
+        "tank_percent": { "type": "number", "minimum": 0, "maximum": 100 },
+        "tank_level_ml": { "type": "number", "minimum": 0 },
+        "tank_capacity_ml": { "type": "number", "minimum": 0 },
+        "last_fill_at": { "type": "string", "format": "date-time" }
+      },
+      "additionalProperties": false
+    },
+    "EnvironmentSnapshot": {
+      "type": "object",
+      "properties": {
+        "temperature_c": { "type": "number" },
+        "ph": { "type": "number" },
+        "orp_mv": { "type": "number" },
+        "floats": {
+          "type": "object",
+          "properties": {
+            "main": { "type": "boolean" },
+            "min": { "type": "boolean" },
+            "max": { "type": "boolean" }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": true
+    },
+    "SubsystemSnapshot": {
+      "type": "object",
+      "required": ["key"],
+      "properties": {
+        "key": {
+          "type": "string",
+          "pattern": "^[a-z0-9._:-]+$",
+          "description": "Local identifier (e.g., roller, ato)."
+        },
+        "submodule_id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9._:-]{1,48}$",
+          "description": "Optional component scope when multiple submodules exist (e.g., PickleSump.Filter)."
+        },
+        "kind": {
+          "type": "string",
+          "enum": ["roller", "ato", "heater", "sensor"],
+          "default": "roller"
+        },
+        "label": { "type": "string" },
+        "state": { "type": "string" },
+        "badge": { "type": "string" },
+        "setpoints": {
+          "type": "object",
+          "additionalProperties": { "type": ["number", "string", "boolean"] }
+        },
+        "sensors": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["label", "value"],
+            "properties": {
+              "label": { "type": "string" },
+              "value": { "type": ["number", "string"] },
+              "unit": { "type": "string" }
+            },
+            "additionalProperties": false
+          }
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

@@ -87,10 +87,17 @@ backend/
 		services/     # MQTT bridge + future controllers
 	tests/          # Pytest suite
 frontend/         # Vite + Svelte dashboard
+pi-touch-app/     # SvelteKit + Tauri touch dashboard
+shared/           # Shared cross-app logic (chart/data pipelines)
+docs/             # Protocol and maintainer docs
 infrastructure/   # Mosquitto config
 .devcontainer/    # VS Code remote container config
 .vscode/          # VS Code tasks
 ```
+
+## Chart Pipeline
+- Shared chart transforms live in [docs/chart-pipeline.md](docs/chart-pipeline.md).
+- Use this pipeline for all new charts so frontend and touch UIs stay consistent.
 
 ## Next Steps
 - Flesh out telemetry ingestion (MQTT consumers, scheduler for retention policies).

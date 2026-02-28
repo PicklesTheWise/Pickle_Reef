@@ -11,8 +11,9 @@ from ..core.config import settings
 from .module_identity import resolve_module_id
 
 MAX_TRACE_ENTRIES = 10_000
-MAX_HISTORY_WINDOW_MINUTES = 24 * 60
 RETENTION_DAYS = max(0, settings.ws_trace_retention_days)
+MAX_HISTORY_WINDOW_MINUTES = max(24 * 60, RETENTION_DAYS * 24 * 60)
+MAX_HISTORY_WINDOW_HOURS = max(24, RETENTION_DAYS * 24)
 _db_path = Path(settings.ws_trace_db_path)
 _db_path.parent.mkdir(parents=True, exist_ok=True)
 _db_lock = Lock()
@@ -168,7 +169,7 @@ def list_spool_history_from_trace(
     module_id: str | None = None,
     limit: int = 2000,
 ) -> list[dict[str, Any]]:
-    window_bound = max(1, min(window_hours, 24 * 30))
+    window_bound = max(1, min(window_hours, MAX_HISTORY_WINDOW_HOURS))
     query_limit = max(1, min(limit, MAX_TRACE_ENTRIES))
     cutoff = datetime.utcnow() - timedelta(hours=window_bound)
     rows = _query_trace_rows(cutoff=cutoff, module_id=module_id, limit=query_limit)
@@ -188,7 +189,7 @@ def list_ato_history_from_trace(
     module_id: str | None = None,
     limit: int = 2000,
 ) -> list[dict[str, Any]]:
-    window_bound = max(1, min(window_hours, 24 * 30))
+    window_bound = max(1, min(window_hours, MAX_HISTORY_WINDOW_HOURS))
     query_limit = max(1, min(limit, MAX_TRACE_ENTRIES))
     cutoff = datetime.utcnow() - timedelta(hours=window_bound)
     rows = _query_trace_rows(cutoff=cutoff, module_id=module_id, limit=query_limit)
@@ -290,14 +291,15 @@ def _build_ato_sample(recorded_at: str, module_id: str | None, payload: dict[str
     if not isinstance(ato, dict):
         return None
     ato_data = _safe_dict_get(ato, "ato") or ato
+    reservoir = _safe_dict_get(ato_data, "reservoir") or {}
 
     timestamp_ms = _timestamp_to_epoch_ms(recorded_at)
     if timestamp_ms is None:
         return None
 
-    capacity_ml = _resolve_numeric(("tank_capacity_ml",), ato_data)
-    level_ml = _resolve_numeric(("tank_level_ml",), ato_data)
-    tank_percent = _resolve_numeric(("tank_percent",), ato_data)
+    capacity_ml = _resolve_numeric(("tank_capacity_ml",), ato_data, reservoir)
+    level_ml = _resolve_numeric(("tank_level_ml",), ato_data, reservoir)
+    tank_percent = _resolve_numeric(("tank_percent",), ato_data, reservoir)
 
     used_ml: float | None = None
     if capacity_ml is not None and level_ml is not None:

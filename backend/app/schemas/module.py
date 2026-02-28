@@ -20,6 +20,16 @@ HEATER_HYSTERESIS_MIN_C = 0.1
 HEATER_HYSTERESIS_MAX_C = 2.0
 PROBE_TOLERANCE_MIN_C = 0.1
 PROBE_TOLERANCE_MAX_C = 3.0
+PROBE_TIMEOUT_MIN_S = 5
+PROBE_TIMEOUT_MAX_S = 300
+RUNAWAY_DELTA_MIN_C = 0.5
+RUNAWAY_DELTA_MAX_C = 10.0
+MAX_HEATER_ON_MIN_MIN = 1
+MAX_HEATER_ON_MIN_MAX = 120
+STUCK_RELAY_DELTA_MIN_C = 0.1
+STUCK_RELAY_DELTA_MAX_C = 5.0
+STUCK_RELAY_WINDOW_MIN_S = 10
+STUCK_RELAY_WINDOW_MAX_S = 600
 
 
 class ModuleStatus(SQLModel, table=True):
@@ -194,6 +204,40 @@ class ModuleControlRequest(SQLModel):
         ge=PROBE_TOLERANCE_MIN_C,
         le=PROBE_TOLERANCE_MAX_C,
         description="Allowed delta between probe readings before mismatch alarm (°C)",
+    )
+    probe_timeout_s: int | None = Field(
+        default=None,
+        ge=PROBE_TIMEOUT_MIN_S,
+        le=PROBE_TIMEOUT_MAX_S,
+        description="Seconds before stale probe data triggers timeout safety checks",
+    )
+    runaway_delta_c: float | None = Field(
+        default=None,
+        ge=RUNAWAY_DELTA_MIN_C,
+        le=RUNAWAY_DELTA_MAX_C,
+        description="Overshoot threshold above setpoint before runaway alarm logic trips (°C)",
+    )
+    max_heater_on_min: int | None = Field(
+        default=None,
+        ge=MAX_HEATER_ON_MIN_MIN,
+        le=MAX_HEATER_ON_MIN_MAX,
+        description="Maximum continuous heater-on runtime before timeout safety triggers (minutes)",
+    )
+    stuck_relay_delta_c: float | None = Field(
+        default=None,
+        ge=STUCK_RELAY_DELTA_MIN_C,
+        le=STUCK_RELAY_DELTA_MAX_C,
+        description="Temperature rise delta used by stuck relay detection logic (°C)",
+    )
+    stuck_relay_window_s: int | None = Field(
+        default=None,
+        ge=STUCK_RELAY_WINDOW_MIN_S,
+        le=STUCK_RELAY_WINDOW_MAX_S,
+        description="Observation window for stuck relay detection (seconds)",
+    )
+    alarm_snooze: bool | None = Field(
+        default=None,
+        description="When true, request immediate alarm snooze/acknowledge behavior from module firmware",
     )
 
     @model_validator(mode="after")

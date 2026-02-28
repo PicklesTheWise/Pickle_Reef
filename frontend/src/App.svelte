@@ -15,6 +15,16 @@
   } from './lib/api'
   import LineChart from './lib/LineChart.svelte'
   import ChartWidget from './lib/ChartWidget.svelte'
+  import {
+    buildUsageSeriesPreferLevels,
+    buildAtoUsageSeries,
+    findRecentResetTimestamp,
+    normalizeTemperatureHistorySamples,
+    alignSamplesByResolution,
+    computePaddedRange,
+    buildHeaterActivationSeries,
+    buildVerticalMarkerSegments,
+  } from './lib/chartPipeline'
 
   const DEFAULT_RUNTIME = 5000
   const DEFAULT_ROLLER_SPEED = 180
@@ -84,6 +94,8 @@
   let lastAlarmKeys = new Set()
   let acknowledgedAlarmKeys = new Set()
   let activeThermistorAlarmDetails = null
+  let alarmActionBusy = false
+  let alarmActionError = ''
   let atoStats = {
     count: 0,
     frequency_per_hour: 0,
@@ -117,6 +129,12 @@
   let heaterSetpointMaxC = 26
   let heaterHysteresisSpanC = 0.2
   let heaterProbeToleranceC = 0.7
+  let heaterProbeTimeoutS = 45
+  let heaterRunawayDeltaC = 2
+  let heaterMaxOnMinutes = 15
+  let heaterStuckRelayDeltaC = 0.5
+  let heaterStuckRelayWindowS = 60
+  let heaterControlSection = 'basic'
   let latestTemperatureSample = null
   let selectedHeaterSamples = []
   let heaterSamplesInWindow = []
@@ -133,6 +151,7 @@
   const USAGE_HISTORY_WINDOW_HOURS = USAGE_HISTORY_WINDOW_MS / HOUR_IN_MS
   const TANK_USAGE_HISTORY_MS = 30 * 24 * HOUR_IN_MS
   const HEATER_HISTORY_WINDOW_MS = 72 * HOUR_IN_MS
+  const HEATER_DUTY_WINDOW_MS = HOUR_IN_MS
   const HEATER_SETPOINT_MIN_BOUND_C = 10
   const HEATER_SETPOINT_MAX_BOUND_C = 35
   const DEFAULT_HEATER_HYSTERESIS_SPAN_C = 0.2
@@ -141,6 +160,21 @@
   const DEFAULT_PROBE_TOLERANCE_C = 0.7
   const PROBE_TOLERANCE_MIN_C = 0.1
   const PROBE_TOLERANCE_MAX_C = 3
+  const DEFAULT_PROBE_TIMEOUT_S = 45
+  const PROBE_TIMEOUT_MIN_S = 5
+  const PROBE_TIMEOUT_MAX_S = 300
+  const DEFAULT_RUNAWAY_DELTA_C = 2
+  const RUNAWAY_DELTA_MIN_C = 0.5
+  const RUNAWAY_DELTA_MAX_C = 10
+  const DEFAULT_MAX_HEATER_ON_MIN = 15
+  const MAX_HEATER_ON_MIN_MIN = 1
+  const MAX_HEATER_ON_MIN_MAX = 120
+  const DEFAULT_STUCK_RELAY_DELTA_C = 0.5
+  const STUCK_RELAY_DELTA_MIN_C = 0.1
+  const STUCK_RELAY_DELTA_MAX_C = 5
+  const DEFAULT_STUCK_RELAY_WINDOW_S = 60
+  const STUCK_RELAY_WINDOW_MIN_S = 10
+  const STUCK_RELAY_WINDOW_MAX_S = 600
   const HERO_AVERAGE_WINDOW_MS = 72 * HOUR_IN_MS
   const usageWindowPresets = [
     { hours: 1, label: '1h', description: 'Rolling last hour' },
@@ -179,6 +213,41 @@
     temperature: 'chart-temperature',
     ato: 'chart-ato',
     filter: 'chart-filter',
+  }
+  const CHART_FOCUS_KEY_TO_ID = CHART_FOCUS_TARGETS
+  const CHART_FOCUS_IDS = new Set(Object.values(CHART_FOCUS_TARGETS))
+
+  let isCompactEmbed = false
+  let compactEmbedTargetId = CHART_FOCUS_TARGETS.temperature
+
+  const updateCompactEmbedStateFromLocation = () => {
+    if (typeof window === 'undefined') return
+    const params = new URLSearchParams(window.location.search)
+    const isIframeContext = (() => {
+      try {
+        return window.self !== window.top
+      } catch {
+        return true
+      }
+    })()
+    isCompactEmbed = params.get('embed') === 'compact' || isIframeContext
+    const chartParam = (params.get('chart') ?? '').toString().trim().toLowerCase()
+    const hashTarget = decodeURIComponent(window.location.hash.replace(/^#/, '').trim())
+    const paramTarget = CHART_FOCUS_KEY_TO_ID[chartParam]
+    if (isCompactEmbed) {
+      compactEmbedTargetId = paramTarget ?? CHART_FOCUS_TARGETS.temperature
+      return
+    }
+    compactEmbedTargetId = paramTarget
+      ? paramTarget
+      : CHART_FOCUS_IDS.has(hashTarget)
+        ? hashTarget
+        : CHART_FOCUS_TARGETS.temperature
+  }
+
+  const shouldRenderChartInView = (targetId) => {
+    if (!isCompactEmbed) return true
+    return compactEmbedTargetId === targetId
   }
 
   const focusChartByKey = (key) => {
@@ -781,7 +850,7 @@
     { border: 'rgba(160, 236, 174, 0.9)', background: 'rgba(160, 236, 174, 0.18)' },
   ]
 
-  const buildTemperatureSeries = (samples = [], setpointTarget = null, setpointMin = null, setpointMax = null) => {
+  const buildTemperatureSeries = (samples = []) => {
     if (!samples.length) {
       return { datasets: [], yMin: undefined, yMax: undefined }
     }
@@ -791,12 +860,6 @@
       { label: 'Temp 2', points: [] },
     ]
     const values = []
-    const toFiniteNumber = (value) => {
-      if (value == null) return null
-      const numeric = typeof value === 'number' ? value : Number(value)
-      return Number.isFinite(numeric) ? numeric : null
-    }
-    const finiteSetpoint = toFiniteNumber(setpointTarget)
 
     samples.forEach((sample) => {
       probeSeries.forEach((bucket, index) => {
@@ -808,19 +871,18 @@
       })
     })
 
-    if (finiteSetpoint != null) {
-      values.push(finiteSetpoint)
-    }
-
       if (!values.length) {
         return { datasets: [], yMin: undefined, yMax: undefined }
       }
 
-      const minValue = Math.min(...values)
-      const maxValue = Math.max(...values)
-      const padding = Math.max(0.5, (maxValue - minValue) * 0.15 || 0.8)
-      const yMin = minValue - padding
-      const yMax = maxValue + padding
+      const range = computePaddedRange(values, {
+        minPadding: 0.5,
+        fallbackPadding: 0.8,
+        paddingRatio: 0.15,
+      })
+      const yMin = range.min
+      const yMax = range.max
+      const padding = range.padding
 
       /** @type {any[]} */
       const datasets = []
@@ -831,29 +893,23 @@
           data: entry.points,
           borderColor: palette.border,
           backgroundColor: palette.background,
-          borderWidth: 2,
+          borderWidth: 2.6,
           fill: false,
-          tension: 0.3,
-          pointRadius: 2,
-          pointHoverRadius: 4,
+          tension: 0.35,
+          pointRadius: 0,
+          pointHoverRadius: 2,
           spanGaps: true,
         })
       })
 
-      const heaterHigh = yMax - padding * 0.2
-      const heaterLow = yMin + padding * 0.2
-      const heaterSeries = samples.map((sample) => ({
-        x: sample.timestamp,
-        y: sample.heaterState ? heaterHigh : heaterLow,
-        heaterOn: sample.heaterState,
-      }))
+      const heaterSeries = buildHeaterActivationSeries(samples, range, { insetRatio: 0.2 })
       if (heaterSeries.length) {
         datasets.push({
           label: 'Activation',
           data: heaterSeries,
           borderColor: 'rgba(246, 195, 67, 0.95)',
           backgroundColor: 'rgba(246, 195, 67, 0.15)',
-          borderWidth: 2,
+          borderWidth: 2.3,
           fill: false,
           stepped: true,
           pointRadius: 0,
@@ -861,29 +917,6 @@
           tension: 0,
         })
       }
-
-      const pushSetpointDataset = (label, value, options = {}) => {
-        if (value == null) return
-        datasets.push({
-          label,
-          data: samples.map((sample) => ({
-            x: sample.timestamp,
-            y: value,
-          })),
-          borderColor: options.borderColor ?? 'rgba(255, 255, 255, 0.65)',
-          borderWidth: options.borderWidth ?? 2,
-          borderDash: options.borderDash ?? [6, 4],
-          fill: options.fill ?? false,
-          pointRadius: 0,
-          pointHoverRadius: 0,
-          tension: 0,
-        })
-      }
-
-      pushSetpointDataset('Setpoint', finiteSetpoint, {
-        borderColor: 'rgba(255, 255, 255, 0.75)',
-        borderDash: [6, 4],
-      })
 
       return { datasets, yMin, yMax }
     }
@@ -963,12 +996,6 @@
     return numeric * FLOW_ML_PER_MS
   }
 
-  const isAtoResetEvent = (run = {}) => {
-    const type = (run.cycle_type ?? '').toString().toLowerCase()
-    const trigger = (run.trigger ?? '').toString().toLowerCase()
-    return type.includes('reset') || trigger.includes('refill') || trigger.includes('reset')
-  }
-
   
 
   
@@ -1024,13 +1051,8 @@
   }
 
   const buildActivationDatasets = (markers, maxValue, options = {}) => {
-    if (!markers?.length || !maxValue) return []
-    const data = []
-    markers.forEach((marker) => {
-      data.push({ x: marker.ts, y: 0 })
-      data.push({ x: marker.ts, y: maxValue })
-      data.push({ x: null, y: null })
-    })
+    const data = buildVerticalMarkerSegments(markers, maxValue)
+    if (!data.length) return []
     return [
       {
         label: options.label ?? 'Roller activations',
@@ -1083,51 +1105,6 @@
     return `${datasetLabel}: ${formatCelsiusValue(value)} • ${formatCycleTimestamp(timeValue)}`
   }
 
-  const buildAtoVolumePoints = (runs) => {
-    if (!runs?.length) return []
-    const sortedRuns = [...runs].sort(
-      (a, b) => new Date(a.recorded_at).getTime() - new Date(b.recorded_at).getTime()
-    )
-    let cumulative = 0
-    return sortedRuns.map((run) => {
-      const ts = new Date(run.recorded_at).getTime()
-      const duration = Math.max(0, run.duration_ms ?? 0)
-      const volume = runtimeMsToMilliliters(duration)
-      const resetEvent = isAtoResetEvent(run)
-      if (resetEvent) {
-        cumulative = 0
-      }
-      cumulative += volume
-      return {
-        ts,
-        duration,
-        volume,
-        cumulative,
-        timestamp: run.recorded_at,
-        reset: resetEvent,
-      }
-    })
-  }
-
-  const findRecentTankResetTimestamp = (samples = []) => {
-    if (!samples?.length) return null
-    let previous = null
-    for (let idx = samples.length - 1; idx >= 0; idx -= 1) {
-      const sample = samples[idx]
-      if (!sample) continue
-      const used = sample.usedMl
-      if (typeof used !== 'number') continue
-      if (used <= TANK_RESET_THRESHOLD_ML) {
-        return sample.timestamp
-      }
-      if (previous != null && used + TANK_RESET_THRESHOLD_ML < previous) {
-        return sample.timestamp
-      }
-      previous = used
-    }
-    return null
-  }
-
   const deriveSummary = (dataset) => {
     const buckets = new Map()
     dataset.forEach((row) => {
@@ -1158,7 +1135,7 @@
       modules = filteredModules
       await loadSpoolUsageHistory()
       await loadTemperatureHistory()
-      await loadLogHistoryBackfill(24)
+      await loadLogHistoryBackfill(USAGE_HISTORY_WINDOW_HOURS)
       recordTankUsageSnapshot(filteredModules)
       recordHeaterTelemetrySnapshot(filteredModules)
       error = ''
@@ -1207,6 +1184,7 @@
   }
 
   onMount(() => {
+    updateCompactEmbedStateFromLocation()
     refresh()
     loadCycleHistory(cycleWindow)
     const refreshInterval = setInterval(() => {
@@ -1217,6 +1195,7 @@
     }, 20000)
     if (typeof window !== 'undefined') {
       window.addEventListener('message', handleExternalDashboardMessage)
+      window.addEventListener('hashchange', updateCompactEmbedStateFromLocation)
     }
     return () => {
       clearInterval(refreshInterval)
@@ -1226,6 +1205,7 @@
       }
       if (typeof window !== 'undefined') {
         window.removeEventListener('message', handleExternalDashboardMessage)
+        window.removeEventListener('hashchange', updateCompactEmbedStateFromLocation)
       }
       stopWsLogPolling()
     }
@@ -1354,6 +1334,38 @@
     return Number(clamped.toFixed(2))
   }
 
+  const clampProbeTimeoutS = (value) => {
+    const numeric = typeof value === 'number' ? value : Number(value)
+    if (!Number.isFinite(numeric)) return undefined
+    return Math.round(Math.min(Math.max(numeric, PROBE_TIMEOUT_MIN_S), PROBE_TIMEOUT_MAX_S))
+  }
+
+  const clampRunawayDeltaC = (value) => {
+    const numeric = typeof value === 'number' ? value : Number(value)
+    if (!Number.isFinite(numeric)) return undefined
+    const clamped = Math.min(Math.max(numeric, RUNAWAY_DELTA_MIN_C), RUNAWAY_DELTA_MAX_C)
+    return Number(clamped.toFixed(2))
+  }
+
+  const clampMaxHeaterOnMinutes = (value) => {
+    const numeric = typeof value === 'number' ? value : Number(value)
+    if (!Number.isFinite(numeric)) return undefined
+    return Math.round(Math.min(Math.max(numeric, MAX_HEATER_ON_MIN_MIN), MAX_HEATER_ON_MIN_MAX))
+  }
+
+  const clampStuckRelayDeltaC = (value) => {
+    const numeric = typeof value === 'number' ? value : Number(value)
+    if (!Number.isFinite(numeric)) return undefined
+    const clamped = Math.min(Math.max(numeric, STUCK_RELAY_DELTA_MIN_C), STUCK_RELAY_DELTA_MAX_C)
+    return Number(clamped.toFixed(2))
+  }
+
+  const clampStuckRelayWindowS = (value) => {
+    const numeric = typeof value === 'number' ? value : Number(value)
+    if (!Number.isFinite(numeric)) return undefined
+    return Math.round(Math.min(Math.max(numeric, STUCK_RELAY_WINDOW_MIN_S), STUCK_RELAY_WINDOW_MAX_S))
+  }
+
   const syncHeaterBandFromSettings = ({ span = heaterHysteresisSpanC, center = temperatureSetpointC } = {}) => {
     if (typeof center !== 'number' || Number.isNaN(center)) return
     const normalizedSpan = clampHysteresisSpan(span) ?? DEFAULT_HEATER_HYSTERESIS_SPAN_C
@@ -1446,39 +1458,30 @@
 
   async function loadTemperatureHistory() {
     try {
-      const history = await fetchTemperatureHistory(24 * 60)
+      const windowMinutes = Math.round(HEATER_HISTORY_WINDOW_MS / (60 * 1000))
+      const history = await fetchTemperatureHistory(windowMinutes, undefined, 10000)
       if (!Array.isArray(history)) return
       const cutoff = Date.now() - HEATER_HISTORY_WINDOW_MS
       const nextHistory = new Map()
-      history.forEach((entry) => {
+      const normalized = normalizeTemperatureHistorySamples(history)
+      normalized.forEach((entry) => {
         if (!entry || typeof entry !== 'object') return
-        const moduleId = entry.module_id
+        const moduleId = entry.moduleId
         const timestamp = Number(entry.timestamp)
         if (!moduleId || !Number.isFinite(timestamp) || timestamp < cutoff) return
-        const thermometers = Array.isArray(entry.thermistors)
-          ? entry.thermistors
-              .map((reading, index) => {
-                const value =
-                  typeof reading?.value === 'number' ? reading.value : Number(reading?.value)
-                if (!Number.isFinite(value)) return null
-                const label =
-                  typeof reading?.label === 'string' && reading.label.trim().length
-                    ? reading.label.trim()
-                    : `Thermometer ${index + 1}`
-                return {
-                  key: buildThermometerKey(label, index),
-                  label,
-                  value,
-                }
-              })
-              .filter((reading) => reading)
-          : []
+        const thermometers = (entry.thermistors ?? [])
+          .map((reading, index) => ({
+            key: buildThermometerKey(reading?.label, index),
+            label: reading?.label ?? `Thermometer ${index + 1}`,
+            value: reading?.value,
+          }))
+          .filter((reading) => typeof reading?.value === 'number' && Number.isFinite(reading.value))
         if (!thermometers.length) return
         const sample = {
           timestamp,
           thermometers,
-          heaterState: Boolean(entry.heater_on),
-          heaterDescription: Boolean(entry.heater_on) ? 'Heating' : 'Idle',
+          heaterState: Boolean(entry.heaterOn),
+          heaterDescription: Boolean(entry.heaterOn) ? 'Heating' : 'Idle',
         }
         const samples = nextHistory.get(moduleId) ?? []
         samples.push(sample)
@@ -1487,7 +1490,7 @@
 
       nextHistory.forEach((samples, moduleId) => {
         const sorted = [...samples].sort((left, right) => left.timestamp - right.timestamp)
-        nextHistory.set(moduleId, downsampleByTimestamp(sorted, UI_REFRESH_INTERVAL_MS))
+        nextHistory.set(moduleId, alignSamplesByResolution(sorted, UI_REFRESH_INTERVAL_MS))
       })
 
       if (nextHistory.size) {
@@ -1498,11 +1501,11 @@
     }
   }
 
-  async function loadLogHistoryBackfill(windowHours = 24) {
+  async function loadLogHistoryBackfill(windowHours = USAGE_HISTORY_WINDOW_HOURS) {
     try {
       const [spoolSamples, atoSamples] = await Promise.all([
-        fetchSpoolTraceHistory(windowHours),
-        fetchAtoTraceHistory(windowHours),
+        fetchSpoolTraceHistory(windowHours, undefined, 10000),
+        fetchAtoTraceHistory(windowHours, undefined, 10000),
       ])
 
       const nextSpool = new Map()
@@ -1810,6 +1813,66 @@
     return null
   }
 
+  const getHeaterSamplesForModule = (module = {}) => {
+    const moduleId = module?.module_id
+    if (!moduleId) return []
+    const direct = heaterTelemetryHistory.get(moduleId)
+    if (Array.isArray(direct) && direct.length) return direct
+    for (const [candidateId, samples] of heaterTelemetryHistory.entries()) {
+      if (!moduleIdMatches(candidateId, moduleId)) continue
+      return Array.isArray(samples) ? samples : []
+    }
+    return []
+  }
+
+  const computeHeaterOnPercent = (samples = [], windowMs = HEATER_DUTY_WINDOW_MS) => {
+    if (!Array.isArray(samples) || !samples.length || windowMs <= 0) return null
+    const now = Date.now()
+    const cutoff = now - windowMs
+    let previousSample = null
+    const inWindow = []
+    for (const sample of samples) {
+      if (!sample || typeof sample.timestamp !== 'number') continue
+      if (sample.timestamp <= cutoff) {
+        previousSample = sample
+        continue
+      }
+      if (sample.timestamp > now) continue
+      inWindow.push(sample)
+    }
+
+    const timeline = []
+    if (previousSample) {
+      timeline.push({ ...previousSample, timestamp: cutoff })
+    }
+    timeline.push(...inWindow)
+    if (!timeline.length) return null
+
+    let onMs = 0
+    for (let index = 0; index < timeline.length; index += 1) {
+      const current = timeline[index]
+      const next = timeline[index + 1]
+      const start = Math.max(cutoff, current.timestamp)
+      const end = next ? Math.min(now, next.timestamp) : now
+      if (end <= start) continue
+      if (current.heaterState) {
+        onMs += end - start
+      }
+    }
+
+    const percent = (onMs / windowMs) * 100
+    return Number.isFinite(percent) ? Math.max(0, Math.min(100, percent)) : null
+  }
+
+  const getHeaterDutyPercentLastHour = (module = {}) => {
+    const liveSamples = getHeaterSamplesForModule(module)
+    const rollingPercent = computeHeaterOnPercent(liveSamples, HEATER_DUTY_WINDOW_MS)
+    if (typeof rollingPercent === 'number') {
+      return rollingPercent
+    }
+    return getHeaterDutyCyclePercent(module)
+  }
+
   const formatDutyCycleLabel = (value) => {
     if (typeof value !== 'number' || Number.isNaN(value)) return '—'
     const clamped = Math.max(0, Math.min(100, value))
@@ -1830,12 +1893,12 @@
         active,
       }
     }
-    const dutyPercent = getHeaterDutyCyclePercent(module)
+    const dutyPercent = getHeaterDutyPercentLastHour(module)
     if (typeof dutyPercent === 'number') {
       const active = dutyPercent >= 1
       return {
         label: active ? 'On' : 'Off',
-        description: `${formatDutyCycleLabel(dutyPercent)} duty`,
+        description: `${formatDutyCycleLabel(dutyPercent)} duty (1h)`,
         active,
       }
     }
@@ -1849,7 +1912,7 @@
   const buildHeaterSummary = (module = {}) => ({
     thermometers: getHeaterThermometers(module),
     heaterState: describeHeaterPowerState(module),
-    dutyPercent: getHeaterDutyCyclePercent(module),
+    dutyPercent: getHeaterDutyPercentLastHour(module),
   })
 
   const deriveModulePumpTimeout = (module = {}) =>
@@ -2198,6 +2261,8 @@
       return
     }
 
+    alarmActionError = ''
+
     const [next, ...rest] = alarmQueue
     alarmQueue = rest
 
@@ -2216,6 +2281,27 @@
     acknowledgedAlarmKeys = updated
     activeAlarmModal = null
     presentNextAlarm()
+  }
+
+  async function snoozeActiveAlarm() {
+    if (!activeAlarmModal || alarmActionBusy) return
+    const moduleId = activeAlarmModal.moduleId
+    if (!moduleId) {
+      alarmActionError = 'Alarm module id is unavailable.'
+      return
+    }
+
+    alarmActionBusy = true
+    alarmActionError = ''
+    try {
+      await updateModuleControls(moduleId, { alarm_snooze: true })
+      acknowledgeAlarm()
+      await refresh()
+    } catch (err) {
+      alarmActionError = err?.message ?? 'Failed to snooze alarm.'
+    } finally {
+      alarmActionBusy = false
+    }
   }
 
   function focusAlarmModule() {
@@ -2382,6 +2468,40 @@
         statusHeater.setpoints?.probe_tolerance_c,
         configHeater.setpoints?.probe_tolerance_c
       ),
+      heaterProbeTimeoutS: pickNumber(
+        statusHeater.probe_timeout_s,
+        statusHeater.setpoints?.probe_timeout_s,
+        configHeater.probe_timeout_s,
+        configHeater.setpoints?.probe_timeout_s
+      ),
+      heaterRunawayDeltaC: pickNumber(
+        statusHeater.runaway_delta_c,
+        statusHeater.setpoints?.runaway_delta_c,
+        configHeater.runaway_delta_c,
+        configHeater.setpoints?.runaway_delta_c
+      ),
+      heaterMaxOnMinutes: pickNumber(
+        statusHeater.max_heater_on_min,
+        statusHeater.heater_timeout_min,
+        statusHeater.setpoints?.max_heater_on_min,
+        configHeater.max_heater_on_min,
+        configHeater.heater_timeout_min,
+        configHeater.setpoints?.max_heater_on_min
+      ),
+      heaterStuckRelayDeltaC: pickNumber(
+        statusHeater.stuck_relay_delta_c,
+        statusHeater.setpoints?.stuck_relay_delta_c,
+        configHeater.stuck_relay_delta_c,
+        configHeater.setpoints?.stuck_relay_delta_c
+      ),
+      heaterStuckRelayWindowS: pickNumber(
+        statusHeater.stuck_relay_window_s,
+        statusHeater.relay_timeout_s,
+        statusHeater.setpoints?.stuck_relay_window_s,
+        configHeater.stuck_relay_window_s,
+        configHeater.relay_timeout_s,
+        configHeater.setpoints?.stuck_relay_window_s
+      ),
     }
 
     return JSON.stringify(snapshot)
@@ -2395,6 +2515,11 @@
     heaterSetpointMaxC = undefined
     heaterHysteresisSpanC = DEFAULT_HEATER_HYSTERESIS_SPAN_C
     heaterProbeToleranceC = DEFAULT_PROBE_TOLERANCE_C
+    heaterProbeTimeoutS = DEFAULT_PROBE_TIMEOUT_S
+    heaterRunawayDeltaC = DEFAULT_RUNAWAY_DELTA_C
+    heaterMaxOnMinutes = DEFAULT_MAX_HEATER_ON_MIN
+    heaterStuckRelayDeltaC = DEFAULT_STUCK_RELAY_DELTA_C
+    heaterStuckRelayWindowS = DEFAULT_STUCK_RELAY_WINDOW_S
     atoMode = deriveAtoMode(module)
     const configMotor = module.configPayload?.motor ?? {}
     const statusMotor = module.statusPayload?.motor ?? {}
@@ -2565,6 +2690,51 @@
       configHeater.probe_tolerance_c
     )
     heaterProbeToleranceC = clampProbeTolerance(resolvedTolerance) ?? DEFAULT_PROBE_TOLERANCE_C
+
+    const resolvedProbeTimeout = coalesceNumber(
+      mergedHeater?.probe_timeout_s,
+      mergedHeater?.setpoints?.probe_timeout_s,
+      configHeater?.probe_timeout_s,
+      configHeater?.setpoints?.probe_timeout_s
+    )
+    heaterProbeTimeoutS = clampProbeTimeoutS(resolvedProbeTimeout) ?? DEFAULT_PROBE_TIMEOUT_S
+
+    const resolvedRunawayDelta = coalesceNumber(
+      mergedHeater?.runaway_delta_c,
+      mergedHeater?.setpoints?.runaway_delta_c,
+      configHeater?.runaway_delta_c,
+      configHeater?.setpoints?.runaway_delta_c
+    )
+    heaterRunawayDeltaC = clampRunawayDeltaC(resolvedRunawayDelta) ?? DEFAULT_RUNAWAY_DELTA_C
+
+    const resolvedMaxOnMinutes = coalesceNumber(
+      mergedHeater?.max_heater_on_min,
+      mergedHeater?.heater_timeout_min,
+      mergedHeater?.setpoints?.max_heater_on_min,
+      configHeater?.max_heater_on_min,
+      configHeater?.heater_timeout_min,
+      configHeater?.setpoints?.max_heater_on_min
+    )
+    heaterMaxOnMinutes = clampMaxHeaterOnMinutes(resolvedMaxOnMinutes) ?? DEFAULT_MAX_HEATER_ON_MIN
+
+    const resolvedStuckRelayDelta = coalesceNumber(
+      mergedHeater?.stuck_relay_delta_c,
+      mergedHeater?.setpoints?.stuck_relay_delta_c,
+      configHeater?.stuck_relay_delta_c,
+      configHeater?.setpoints?.stuck_relay_delta_c
+    )
+    heaterStuckRelayDeltaC = clampStuckRelayDeltaC(resolvedStuckRelayDelta) ?? DEFAULT_STUCK_RELAY_DELTA_C
+
+    const resolvedStuckRelayWindow = coalesceNumber(
+      mergedHeater?.stuck_relay_window_s,
+      mergedHeater?.relay_timeout_s,
+      mergedHeater?.setpoints?.stuck_relay_window_s,
+      configHeater?.stuck_relay_window_s,
+      configHeater?.relay_timeout_s,
+      configHeater?.setpoints?.stuck_relay_window_s
+    )
+    heaterStuckRelayWindowS =
+      clampStuckRelayWindowS(resolvedStuckRelayWindow) ?? DEFAULT_STUCK_RELAY_WINDOW_S
   }
 
   $: hydratedModules = modules.map(hydrateModule)
@@ -2719,43 +2889,29 @@
     atoLifetimeActivationCount > 0
       ? atoWaterUsedSinceRefillMl / atoLifetimeActivationCount
       : null
-  $: tankLastRefillTimestamp = findRecentTankResetTimestamp(selectedTankUsageSamples)
+  $: tankLastRefillTimestamp = findRecentResetTimestamp(selectedTankUsageSamples, {
+    valueKey: 'usedMl',
+    resetThreshold: TANK_RESET_THRESHOLD_ML,
+  })
   $: usageChart = (() => {
-    const now = Date.now()
-    const cutoff = now - usageChartWindowMs
-    const entries = orderedRollerUsageEntries.filter((entry) => entry.timestamp >= cutoff)
-    if (!entries.length && selectedSpoolLevelSamples.length) {
-      const inWindow = selectedSpoolLevelSamples.filter((sample) => sample.timestamp >= cutoff)
-      const samples = inWindow.length ? inWindow : selectedSpoolLevelSamples.slice(-240)
-      const points = samples.map((sample) => ({
-        timestamp: sample.timestamp,
-        ts: sample.timestamp,
-        cumulativeMm: sample.usedMm,
-      }))
-      const maxValue = Math.max(...points.map((point) => point.cumulativeMm), 0)
-      return {
-        points: maxValue > 0 ? points : [],
-        totalMm: points.length ? points[points.length - 1].cumulativeMm : 0,
-        windowStart: cutoff,
-        maxValue,
-      }
-    }
-    let cumulative = 0
-    const normalized = entries.map((entry) => {
-      cumulative += entry.deltaMm
-      return {
-        timestamp: entry.timestamp,
-        ts: entry.timestamp,
-        cumulativeMm: cumulative,
-      }
+    const cutoff = Date.now() - usageChartWindowMs
+    const series = buildUsageSeriesPreferLevels({
+      levelSamples: selectedSpoolLevelSamples,
+      deltaEntries: orderedRollerUsageEntries,
+      cutoff,
+      levelValueKey: 'usedMm',
+      deltaValueKey: 'deltaMm',
+      tailLimit: 240,
     })
-    const maxValue = Math.max(...normalized.map((point) => point.cumulativeMm), 0)
-    const points = maxValue > 0 ? normalized : []
     return {
-      points,
-      totalMm: cumulative,
-      windowStart: cutoff,
-      maxValue,
+      points: series.points.map((point) => ({
+        timestamp: point.ts,
+        ts: point.ts,
+        cumulativeMm: point.value,
+      })),
+      totalMm: series.total,
+      windowStart: series.windowStart,
+      maxValue: series.maxValue,
     }
   })()
   $: usageActivationMarkers = (() => {
@@ -2779,11 +2935,11 @@
             data: usageChart.points.map((point) => ({ x: point.ts, y: point.cumulativeMm })),
             borderColor: 'rgba(72, 229, 194, 0.9)',
             backgroundColor: 'rgba(72, 229, 194, 0.15)',
-            borderWidth: 2,
+            borderWidth: 2.6,
             fill: false,
-            tension: 0.25,
-            pointRadius: 3,
-            pointHoverRadius: 4,
+            tension: 0.32,
+            pointRadius: 0,
+            pointHoverRadius: 2,
             pointBackgroundColor: '#f6c343',
             pointBorderColor: '#020710',
           },
@@ -2835,46 +2991,15 @@
     return []
   })()
   $: atoChartPoints = (() => {
-    if (selectedTankUsageSamples.length) {
-      let lastValue = null
-      return [...selectedTankUsageSamples]
-        .filter((sample) => sample.timestamp >= tankUsageCutoff)
-        .sort((a, b) => a.timestamp - b.timestamp)
-        .map((sample) => {
-          const resetDetected = lastValue != null && sample.usedMl + TANK_RESET_THRESHOLD_ML < lastValue
-          lastValue = sample.usedMl
-          return {
-            ts: sample.timestamp,
-            used: sample.usedMl,
-            reset: resetDetected,
-          }
-        })
-    }
-
-      if (selectedAtoLevelSamples.length) {
-        let lastValue = null
-        const inWindow = selectedAtoLevelSamples.filter((sample) => sample.timestamp >= tankUsageCutoff)
-        const samples = inWindow.length ? inWindow : selectedAtoLevelSamples.slice(-240)
-        return samples
-          .map((sample) => {
-            const resetDetected = lastValue != null && sample.usedMl + TANK_RESET_THRESHOLD_ML < lastValue
-            lastValue = sample.usedMl
-            return {
-              ts: sample.timestamp,
-              used: sample.usedMl,
-              reset: resetDetected,
-            }
-          })
-      }
-
     const fallbackRuns = selectedAtoRuns.length ? selectedAtoRuns : atoRuns
-    return buildAtoVolumePoints(fallbackRuns)
-      .filter((point) => point.ts >= tankUsageCutoff)
-      .map((point) => ({
-        ts: point.ts,
-        used: point.cumulative,
-        reset: point.reset,
-      }))
+    return buildAtoUsageSeries({
+      tankSamples: selectedTankUsageSamples,
+      levelSamples: selectedAtoLevelSamples,
+      fallbackRuns,
+      cutoff: tankUsageCutoff,
+      resetThreshold: TANK_RESET_THRESHOLD_ML,
+      runtimeMsToMilliliters,
+    })
   })()
   $: atoChartMaxValue = (() => {
     if (!atoChartPoints.length) return 0
@@ -2906,11 +3031,11 @@
           })),
           borderColor: 'rgba(95, 179, 255, 0.85)',
           backgroundColor: 'rgba(95, 179, 255, 0.15)',
-          borderWidth: 2,
+          borderWidth: 2.6,
           fill: false,
-          tension: 0.35,
-          pointRadius: 3,
-          pointHoverRadius: 4,
+          tension: 0.4,
+          pointRadius: 0,
+          pointHoverRadius: 2,
           pointBackgroundColor: '#5fb3ff',
           pointBorderColor: '#020710',
         },
@@ -2953,12 +3078,7 @@
     const inWindow = selectedHeaterSamples.filter((sample) => sample.timestamp >= cutoff)
     return inWindow.length ? inWindow : selectedHeaterSamples.slice(-240)
   })()
-  $: temperatureSeries = buildTemperatureSeries(
-    heaterSamplesInWindow,
-    temperatureSetpointC,
-    heaterSetpointMinC,
-    heaterSetpointMaxC
-  )
+  $: temperatureSeries = buildTemperatureSeries(heaterSamplesInWindow)
   $: temperatureChartDatasets = temperatureSeries.datasets
   $: temperatureYAxisMin = temperatureSeries.yMin
   $: temperatureYAxisMax = temperatureSeries.yMax
@@ -3035,6 +3155,7 @@
       const physicalTarget = hydratedModules.find((module) => module.module_id === getCardModuleId(targetCard))
       prefillControls(physicalTarget ?? targetCard)
     }
+    heaterControlSection = 'basic'
     controlsVisible = true
   }
 
@@ -3051,6 +3172,11 @@
       controlUpdateTimer = null
     }
     controlUpdatePending = false
+    heaterControlSection = 'basic'
+  }
+
+  const openHeaterControlSection = (section = 'basic') => {
+    heaterControlSection = section === 'alarms' ? 'alarms' : 'basic'
   }
 
   const setUsageChartWindow = (hours) => {
@@ -3146,6 +3272,52 @@
     scheduleControlUpdate()
   }
 
+  const updateHeaterAlarmSetting = (key, eventOrValue) => {
+    const raw =
+      typeof eventOrValue === 'object' && eventOrValue?.target
+        ? eventOrValue.target.value
+        : eventOrValue
+
+    if (key === 'probe_timeout_s') {
+      const normalized = clampProbeTimeoutS(raw)
+      if (normalized == null) return false
+      heaterProbeTimeoutS = normalized
+      return true
+    }
+    if (key === 'runaway_delta_c') {
+      const normalized = clampRunawayDeltaC(raw)
+      if (normalized == null) return false
+      heaterRunawayDeltaC = normalized
+      return true
+    }
+    if (key === 'max_heater_on_min') {
+      const normalized = clampMaxHeaterOnMinutes(raw)
+      if (normalized == null) return false
+      heaterMaxOnMinutes = normalized
+      return true
+    }
+    if (key === 'stuck_relay_delta_c') {
+      const normalized = clampStuckRelayDeltaC(raw)
+      if (normalized == null) return false
+      heaterStuckRelayDeltaC = normalized
+      return true
+    }
+    if (key === 'stuck_relay_window_s') {
+      const normalized = clampStuckRelayWindowS(raw)
+      if (normalized == null) return false
+      heaterStuckRelayWindowS = normalized
+      return true
+    }
+    return false
+  }
+
+  const commitHeaterAlarmSetting = (key, eventOrValue) => {
+    const changed = updateHeaterAlarmSetting(key, eventOrValue)
+    if (changed) {
+      scheduleControlUpdate()
+    }
+  }
+
   const setCycleChartWindow = (hours) => {
     const normalized = Math.max(1, Math.min(hours, MAX_CYCLE_WINDOW_HOURS))
     if (cycleWindow === normalized) return
@@ -3177,6 +3349,11 @@
     if (hasValue(temperatureSetpointC)) payload.heater_setpoint_c = Number(temperatureSetpointC)
     if (hasValue(heaterHysteresisSpanC)) payload.heater_hysteresis_span_c = Number(heaterHysteresisSpanC)
     if (hasValue(heaterProbeToleranceC)) payload.probe_tolerance_c = Number(heaterProbeToleranceC)
+    if (hasValue(heaterProbeTimeoutS)) payload.probe_timeout_s = Number(heaterProbeTimeoutS)
+    if (hasValue(heaterRunawayDeltaC)) payload.runaway_delta_c = Number(heaterRunawayDeltaC)
+    if (hasValue(heaterMaxOnMinutes)) payload.max_heater_on_min = Number(heaterMaxOnMinutes)
+    if (hasValue(heaterStuckRelayDeltaC)) payload.stuck_relay_delta_c = Number(heaterStuckRelayDeltaC)
+    if (hasValue(heaterStuckRelayWindowS)) payload.stuck_relay_window_s = Number(heaterStuckRelayWindowS)
 
     if (Object.keys(payload).length === 0) {
       return
@@ -3514,7 +3691,8 @@
   <title>Pickle Reef Console</title>
 </svelte:head>
 
-<main class="layout dashboard-view">
+<main class="layout dashboard-view" class:layout--compact-embed={isCompactEmbed}>
+  {#if !isCompactEmbed}
   <section class="hero">
     <div class="hero-copy">
       <h1 aria-label="Pickle Reef controller console">PICKLE REEF</h1>
@@ -3563,11 +3741,13 @@
       </div>
     </div>
     <div class="hero-logo">
-      <img src="/picklereeflogo.png" alt="Pickle Reef logo" />
+      <img src={`${import.meta.env.BASE_URL}picklereeflogo.png`} alt="Pickle Reef logo" />
     </div>
     <div class="glow"></div>
   </section>
+  {/if}
 
+  {#if !isCompactEmbed}
   <section class="grid metrics">
     {#each Object.keys(metricCopy) as metric}
       <article class="panel metric-card" class:metric-card--temperature={metric === 'temperature'}>
@@ -3604,8 +3784,10 @@
       </article>
     {/each}
   </section>
+  {/if}
 
-  <section class="grid modules">
+  <section class="grid modules" class:modules--compact-embed={isCompactEmbed}>
+    {#if !isCompactEmbed}
     <div class="panel module-panel" aria-label="Module overview">
       <header>
         <div>
@@ -3672,9 +3854,9 @@
                     <small>{module.heater_summary?.heaterState?.description ?? 'Waiting for heater telemetry'}</small>
                   </div>
                   <div class="insight">
-                    <p>Duty / min</p>
+                    <p>Duty (1h)</p>
                     <strong>{formatDutyCycleLabel(module.heater_summary?.dutyPercent)}</strong>
-                    <small>Rolling 60-second average</small>
+                    <small>On-time over last rolling hour</small>
                   </div>
                 {:else if isRollerSubsystem(module.subsystem)}
                   <div class="insight">
@@ -3759,6 +3941,7 @@
         {/if}
       </ul>
     </div>
+    {/if}
 
     <div class="panel timeline" aria-label="Last telemetry readings">
       <header>
@@ -3769,10 +3952,78 @@
       {#if cycleHistoryError}
         <div class="banner warning">{cycleHistoryError}</div>
       {/if}
+      {#if shouldRenderChartInView('chart-temperature')}
+      <div class="chart-anchor" id="chart-temperature">
+        <ChartWidget
+          ariaLabel="Heater temperature history"
+          label="Heater Window"
+          description={describeUsageWindow(temperatureChartWindowHours)}
+          buttons={temperatureWindowButtons}
+          activeValue={temperatureChartWindowHours}
+          on:select={(event) => setTemperatureChartWindow(event.detail)}
+        >
+        {#if temperatureChartLoading}
+          <div class="chart-widget__placeholder">
+            <p class="placeholder">Loading heater telemetry…</p>
+          </div>
+        {:else if !temperatureChartHasData}
+          <div class="chart-widget__placeholder">
+            <p class="placeholder">
+              No heater telemetry captured in the last {formatUsageWindowShort(temperatureChartWindowHours)}.
+            </p>
+          </div>
+        {:else}
+          <LineChart
+            datasets={temperatureChartDatasets}
+            ariaLabel="Heater temperature chart"
+            yTitle="Temperature (°C)"
+            xTitle="Time"
+            xTickFormatter={formatCycleTimestamp}
+            tooltipFormatter={temperatureTooltipFormatter}
+            height={320}
+            fontSize={16}
+            fontWeight="600"
+            tickColor="rgba(255, 255, 255, 0.95)"
+            gridColor="rgba(255, 255, 255, 0.2)"
+            yBeginAtZero={false}
+            yMin={temperatureYAxisMin}
+            yMax={temperatureYAxisMax}
+            showLegend={true}
+          />
+        {/if}
+
+        <svelte:fragment slot="meta">
+          {#if temperatureChartMeta}
+            <div class="chart-meta temperature-meta">
+              <div>
+                <p>Last sample</p>
+                <strong>{formatTimestamp(temperatureChartMeta.timestamp)}</strong>
+              </div>
+              {#each temperatureChartMeta.readings as reading}
+                <div>
+                  <p>{reading.label}</p>
+                  <strong>{formatCelsiusValue(reading.value)}</strong>
+                </div>
+              {/each}
+              <div>
+                <p>Heater</p>
+                <strong class:active={temperatureChartMeta.heaterOn}>
+                  {temperatureChartMeta.heaterOn ? 'Heating' : 'Idle'}
+                </strong>
+                <small>{temperatureChartMeta.description || 'Awaiting heater telemetry'}</small>
+              </div>
+            </div>
+          {/if}
+        </svelte:fragment>
+        </ChartWidget>
+      </div>
+      {/if}
+
+      {#if shouldRenderChartInView('chart-filter')}
       <div class="chart-anchor" id="chart-filter">
         <ChartWidget
           ariaLabel="Estimated filter media usage"
-          label="Usage window"
+          label="Filter Usage Window"
           description={describeUsageWindow(usageChartWindowHours)}
           buttons={usageWindowButtons}
           activeValue={usageChartWindowHours}
@@ -3834,95 +4085,13 @@
         </svelte:fragment>
         </ChartWidget>
       </div>
+      {/if}
 
-      <div class="chart-anchor" id="chart-temperature">
-        <ChartWidget
-          ariaLabel="Heater temperature history"
-          label="Heater window"
-          description={describeUsageWindow(temperatureChartWindowHours)}
-          buttons={temperatureWindowButtons}
-          activeValue={temperatureChartWindowHours}
-          on:select={(event) => setTemperatureChartWindow(event.detail)}
-        >
-        {#if temperatureChartLoading}
-          <div class="chart-widget__placeholder">
-            <p class="placeholder">Loading heater telemetry…</p>
-          </div>
-        {:else if !temperatureChartHasData}
-          <div class="chart-widget__placeholder">
-            <p class="placeholder">
-              No heater telemetry captured in the last {formatUsageWindowShort(temperatureChartWindowHours)}.
-            </p>
-          </div>
-        {:else}
-          <LineChart
-            datasets={temperatureChartDatasets}
-            ariaLabel="Heater temperature chart"
-            yTitle="Temperature (°C)"
-            xTitle="Time"
-            xTickFormatter={formatCycleTimestamp}
-            tooltipFormatter={temperatureTooltipFormatter}
-            height={320}
-            fontSize={16}
-            fontWeight="600"
-            tickColor="rgba(255, 255, 255, 0.95)"
-            gridColor="rgba(255, 255, 255, 0.2)"
-            yBeginAtZero={false}
-            yMin={temperatureYAxisMin}
-            yMax={temperatureYAxisMax}
-            showLegend={true}
-          />
-        {/if}
-
-        <svelte:fragment slot="controls">
-          <label class="setpoint-control" for="temperature-setpoint">
-            <span>Setpoint</span>
-            <div class="setpoint-control__input">
-              <input
-                id="temperature-setpoint"
-                type="number"
-                min={HEATER_SETPOINT_MIN_BOUND_C}
-                max={HEATER_SETPOINT_MAX_BOUND_C}
-                step="0.1"
-                bind:value={temperatureSetpointC}
-                inputmode="decimal"
-                aria-label="Temperature setpoint"
-                on:input={(event) => handleSetpointInput('target', event)}
-              />
-              <span class="unit">°C</span>
-            </div>
-          </label>
-        </svelte:fragment>
-
-        <svelte:fragment slot="meta">
-          {#if temperatureChartMeta}
-            <div class="chart-meta temperature-meta">
-              <div>
-                <p>Last sample</p>
-                <strong>{formatTimestamp(temperatureChartMeta.timestamp)}</strong>
-              </div>
-              {#each temperatureChartMeta.readings as reading}
-                <div>
-                  <p>{reading.label}</p>
-                  <strong>{formatCelsiusValue(reading.value)}</strong>
-                </div>
-              {/each}
-              <div>
-                <p>Heater</p>
-                <strong class:active={temperatureChartMeta.heaterOn}>
-                  {temperatureChartMeta.heaterOn ? 'Heating' : 'Idle'}
-                </strong>
-                <small>{temperatureChartMeta.description || 'Awaiting heater telemetry'}</small>
-              </div>
-            </div>
-          {/if}
-        </svelte:fragment>
-      </ChartWidget>
-
+      {#if shouldRenderChartInView('chart-ato')}
       <div class="chart-anchor" id="chart-ato">
         <ChartWidget
           ariaLabel="ATO cycles chart"
-          label="ATO window"
+          label="ATO Window"
           description={describeUsageWindow(activeCycleWindowHours)}
           buttons={cycleWindowButtons}
           activeValue={activeCycleWindowHours}
@@ -3990,8 +4159,9 @@
         </svelte:fragment>
         </ChartWidget>
       </div>
-      </div>
+      {/if}
 
+      {#if !isCompactEmbed}
       <div class="timeline-divider"></div>
 
       <ul>
@@ -4006,6 +4176,7 @@
           </li>
         {/each}
       </ul>
+      {/if}
     </div>
 
   </section>
@@ -4106,6 +4277,24 @@
         <small class="control-hint">Changes sync automatically as you adjust settings.</small>
 
         {#if isHeaterView}
+          <div class="heater-control-nav">
+            <button
+              type="button"
+              class={heaterControlSection === 'basic' ? 'primary' : 'ghost'}
+              on:click={() => openHeaterControlSection('basic')}
+            >
+              Basic Controls
+            </button>
+            <button
+              type="button"
+              class={heaterControlSection === 'alarms' ? 'primary' : 'ghost'}
+              on:click={() => openHeaterControlSection('alarms')}
+            >
+              Alarm Controls
+            </button>
+          </div>
+
+          {#if heaterControlSection === 'basic'}
           <div class="form-group heater-setpoints">
             <div class="form-label-row">
               <p class="form-label">Setpoint band</p>
@@ -4189,6 +4378,87 @@
             />
             <small>Trips the thermistor mismatch alarm when probes differ more than this delta.</small>
           </div>
+          {:else}
+          <div class="form-group heater-alarm">
+            <label for="heater-probe-timeout">
+              Probe timeout ({heaterProbeTimeoutS}s)
+            </label>
+            <input
+              id="heater-probe-timeout"
+              type="range"
+              min={PROBE_TIMEOUT_MIN_S}
+              max={PROBE_TIMEOUT_MAX_S}
+              step="1"
+              bind:value={heaterProbeTimeoutS}
+              on:change={(event) => commitHeaterAlarmSetting('probe_timeout_s', event)}
+            />
+            <small>Seconds before probe sampling is considered stale.</small>
+          </div>
+
+          <div class="form-group heater-alarm">
+            <label for="heater-runaway-delta">
+              Runaway delta ({formatCelsiusValue(heaterRunawayDeltaC)})
+            </label>
+            <input
+              id="heater-runaway-delta"
+              type="range"
+              min={RUNAWAY_DELTA_MIN_C}
+              max={RUNAWAY_DELTA_MAX_C}
+              step="0.1"
+              bind:value={heaterRunawayDeltaC}
+              on:change={(event) => commitHeaterAlarmSetting('runaway_delta_c', event)}
+            />
+            <small>Allowed overshoot before runaway protection alarms.</small>
+          </div>
+
+          <div class="form-group heater-alarm">
+            <label for="heater-max-on-minutes">
+              Max heater on-time ({heaterMaxOnMinutes} min)
+            </label>
+            <input
+              id="heater-max-on-minutes"
+              type="range"
+              min={MAX_HEATER_ON_MIN_MIN}
+              max={MAX_HEATER_ON_MIN_MAX}
+              step="1"
+              bind:value={heaterMaxOnMinutes}
+              on:change={(event) => commitHeaterAlarmSetting('max_heater_on_min', event)}
+            />
+            <small>Maximum continuous heater runtime before safety timeout.</small>
+          </div>
+
+          <div class="form-group heater-alarm">
+            <label for="heater-stuck-relay-delta">
+              Stuck relay delta ({formatCelsiusValue(heaterStuckRelayDeltaC)})
+            </label>
+            <input
+              id="heater-stuck-relay-delta"
+              type="range"
+              min={STUCK_RELAY_DELTA_MIN_C}
+              max={STUCK_RELAY_DELTA_MAX_C}
+              step="0.1"
+              bind:value={heaterStuckRelayDeltaC}
+              on:change={(event) => commitHeaterAlarmSetting('stuck_relay_delta_c', event)}
+            />
+            <small>Expected rise threshold used to detect relay-stuck behavior.</small>
+          </div>
+
+          <div class="form-group heater-alarm">
+            <label for="heater-stuck-relay-window">
+              Stuck relay window ({heaterStuckRelayWindowS}s)
+            </label>
+            <input
+              id="heater-stuck-relay-window"
+              type="range"
+              min={STUCK_RELAY_WINDOW_MIN_S}
+              max={STUCK_RELAY_WINDOW_MAX_S}
+              step="5"
+              bind:value={heaterStuckRelayWindowS}
+              on:change={(event) => commitHeaterAlarmSetting('stuck_relay_window_s', event)}
+            />
+            <small>Observation period used by relay fault detection.</small>
+          </div>
+          {/if}
         {/if}
 
         {#if isAtoView}
@@ -4614,10 +4884,16 @@
         <button type="button" class="ghost" on:click={focusAlarmModule}>
           Inspect module
         </button>
+        <button type="button" class="ghost" on:click={snoozeActiveAlarm} disabled={alarmActionBusy}>
+          {alarmActionBusy ? 'Snoozing…' : 'Snooze alarm'}
+        </button>
         <button type="button" class="primary" on:click={acknowledgeAlarm}>
           Acknowledge alarm
         </button>
       </div>
+      {#if alarmActionError}
+        <div class="banner warning">{alarmActionError}</div>
+      {/if}
     </div>
   </div>
 {/if}

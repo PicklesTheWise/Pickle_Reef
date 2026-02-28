@@ -122,6 +122,8 @@
   $: if (chart) {
     chart.data.datasets = datasets ?? []
     const updatedOptions = buildOptions()
+    // Merge options rather than replacing the object, so Chart.js
+    // reliably picks up scale min/max changes on each update.
     chart.options.animation = updatedOptions.animation
     chart.options.interaction = updatedOptions.interaction
     chart.options.elements = updatedOptions.elements
