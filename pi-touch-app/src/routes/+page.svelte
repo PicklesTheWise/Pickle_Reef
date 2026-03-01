@@ -313,11 +313,18 @@
   let swipeStart = null
   let swipeDelta = { x: 0, y: 0 }
   let swipeIntent = null
+  let swipeIsActive = false
+  let swipeStartTime = 0
+  let liveDragOffset = 0
   let activePointerId = null
   let activePointerType = null
   let pointerCaptureActive = false
   let scrollDragStart = null
   let pageDrag = null
+  let lastTouchY = null
+  let touchVelY = 0
+  let momentumRafId = null
+  let scrollY = 0
   let refreshTimer = null
   let usageTimer = null
   let usageRequestInFlight = false
@@ -327,6 +334,8 @@
   let heaterCards = []
   let activeAlarms = []
   let bootstrapping = true
+  let mainEl = null
+  let scrollContentEl = null
   let temperatureHistory = []
   let historyHydrated = false
   let historyHydrationInFlight = false
@@ -345,6 +354,7 @@
     capturing: false,
     lastEvent: '',
   }
+  let debugLines = 'loading…'
   let atoModule = null
   let filterModule = null
   let temperatureHero = { value: '—', detail: 'Awaiting telemetry' }
@@ -538,17 +548,28 @@
         history.scrollRestoration = 'manual'
       }
       window.scrollTo({ top: 0, left: 0, behavior: 'auto' })
-      setTimeout(() => window.scrollTo({ top: 0, left: 0, behavior: 'auto' }), 0)
+      scrollY = 0
     }
     hydrateTemperatureHistory()
     loadModules()
     loadUsage()
+    const debugTimer = setInterval(() => {
+      debugLines = [
+        `sY:${Math.round(scrollY)} mST:${Math.round(mainEl?.scrollTop ?? 0)} max:${getMaxScroll()} mH:${mainEl?.clientHeight ?? 0}/${mainEl?.scrollHeight ?? 0}`,
+        `drag:${pageDrag ? 'YES velY='+pageDrag.velY?.toFixed(1) : 'no'}`,
+        `last:${touchDebug.lastEvent || '-'} ptr:${activePointerType ?? '-'}`,
+        `intent:${swipeIntent ?? '-'} ptr:${activePointerType ?? '-'}`,
+        `event:${touchDebug.lastEvent || '-'}`,
+        `dX:${swipeDelta.x.toFixed(0)} dY:${swipeDelta.y.toFixed(0)}`,
+      ].join('\n')
+    }, 250)
     refreshTimer = setInterval(() => loadModules({ quiet: true }), REFRESH_INTERVAL)
     usageTimer = setInterval(() => loadUsage({ quiet: true }), USAGE_REFRESH_INTERVAL)
     requestAnimationFrame(() => {
       nudgeWindowResize()
       setTimeout(nudgeWindowResize, 200)
     })
+    mainEl?.addEventListener('wheel', handleWheel, { passive: false })
     return () => {
       if (refreshTimer) {
         clearInterval(refreshTimer)
@@ -563,6 +584,8 @@
         usageTimer = null
       }
       document.removeEventListener('pointerdown', closeModeDropdownsOutside)
+      mainEl?.removeEventListener('wheel', handleWheel)
+      clearInterval(debugTimer)
     }
   })
 
@@ -1513,7 +1536,6 @@
   }
 
   const logTouchDebug = (payload = {}) => {
-    if (!ENABLE_TOUCH_DEBUG) return
     touchDebug = {
       pointerType: payload.pointerType ?? touchDebug.pointerType,
       intent: payload.intent ?? touchDebug.intent,
@@ -1562,6 +1584,9 @@
     }
   }
 
+  const isTouchPointer = (pt) => pt === 'touch'
+  const isMouseLikePointer = (pt) => pt === 'mouse' || pt === 'pen'
+
   const beginScrollDrag = (event) => {
     scrollDragStart = {
       startY: event.clientY,
@@ -1574,9 +1599,9 @@
     if (!scrollDragStart) {
       beginScrollDrag(event)
     }
-    if (!scrollDragStart || typeof window === 'undefined') return
+    if (!scrollDragStart) return
     const delta = event.clientY - scrollDragStart.startY
-    window.scrollTo({ top: scrollDragStart.scrollTop - delta })
+    applyScroll(scrollDragStart.scrollTop - delta)
   }
 
   const tryCapturePointer = (target, pointerId) => {
@@ -1593,11 +1618,42 @@
     logTouchDebug({ capturing: false, lastEvent: 'release' })
   }
 
+  const getScrollRoot = () => mainEl
+
+  const getMaxScroll = () => mainEl ? Math.max(0, mainEl.scrollHeight - mainEl.clientHeight) : 0
+  const clampScroll = (val) => Math.max(0, Math.min(val, getMaxScroll()))
+
+  const applyScroll = (val) => {
+    if (!mainEl) return
+    mainEl.scrollTop = clampScroll(val)
+    scrollY = mainEl.scrollTop
+  }
+
+  const getScrollTop = () => mainEl?.scrollTop ?? 0
+
+  const launchMomentumScroll = (velY) => {
+    if (!mainEl) return
+    if (momentumRafId) cancelAnimationFrame(momentumRafId)
+    let v = velY
+    const step = () => {
+      if (Math.abs(v) < 0.5) { momentumRafId = null; return }
+      mainEl.scrollTop += v
+      scrollY = mainEl.scrollTop
+      v *= 0.88
+      momentumRafId = requestAnimationFrame(step)
+    }
+    momentumRafId = requestAnimationFrame(step)
+  }
+
   const resetSwipeState = (target) => {
     releasePointerCapture(target)
     swipeStart = null
     swipeDelta = { x: 0, y: 0 }
     swipeIntent = null
+    swipeIsActive = false
+    liveDragOffset = 0
+    lastTouchY = null
+    touchVelY = 0
     activePointerId = null
     activePointerType = null
     scrollDragStart = null
@@ -1619,6 +1675,9 @@
     swipeStart = { x: event.clientX, y: event.clientY }
     swipeDelta = { x: 0, y: 0 }
     swipeIntent = null
+    swipeIsActive = false
+    liveDragOffset = 0
+    swipeStartTime = performance.now()
     pointerCaptureActive = false
     activePointerType = event.pointerType ?? null
     if (isMouseLikePointer(activePointerType)) {
@@ -1641,13 +1700,18 @@
     if (!swipeIntent) {
       if (absX > 12 && absX > absY) {
         swipeIntent = 'horizontal'
+        swipeIsActive = true
         event.preventDefault()
         tryCapturePointer(event.currentTarget, event.pointerId)
         logTouchDebug({ intent: 'horizontal', lastEvent: 'detect-horizontal' })
       } else if (absY > 12) {
         swipeIntent = 'vertical'
         releasePointerCapture(event.currentTarget)
-        if (!isTouchPointer(activePointerType)) {
+        if (isTouchPointer(activePointerType)) {
+          lastTouchY = event.clientY
+          touchVelY = 0
+          event.preventDefault()
+        } else {
           event.preventDefault()
           applyScrollDrag(event)
         }
@@ -1660,9 +1724,26 @@
 
     if (swipeIntent === 'horizontal') {
       event.preventDefault()
-    } else if (swipeIntent === 'vertical' && !isTouchPointer(activePointerType)) {
+      const raw = swipeDelta.x
+      const atStart = activeIndex === 0
+      const atEnd = activeIndex === moduleCards.length - 1
+      if ((raw > 0 && atStart) || (raw < 0 && atEnd)) {
+        liveDragOffset = raw * 0.25
+      } else {
+        liveDragOffset = raw
+      }
+    } else if (swipeIntent === 'vertical') {
       event.preventDefault()
-      applyScrollDrag(event)
+      if (isTouchPointer(activePointerType)) {
+        if (typeof window !== 'undefined' && lastTouchY != null) {
+          const delta = lastTouchY - event.clientY
+          applyScroll(scrollY + delta)
+          touchVelY = delta
+        }
+        lastTouchY = event.clientY
+      } else {
+        applyScrollDrag(event)
+      }
     }
   }
 
@@ -1671,12 +1752,18 @@
     if (!swipeStart) return
 
     if (swipeIntent === 'vertical') {
+      if (isTouchPointer(activePointerType)) {
+        launchMomentumScroll(touchVelY)
+      }
       resetSwipeState(event?.currentTarget)
       return
     }
 
     const { x, y } = swipeDelta
-    if (swipeIntent === 'horizontal' && Math.abs(x) > Math.abs(y) && Math.abs(x) > SWIPE_THRESHOLD) {
+    const elapsed = performance.now() - swipeStartTime
+    const velocity = elapsed > 0 ? x / elapsed : 0
+    const isFlick = Math.abs(velocity) > 0.35 && Math.abs(x) > 10
+    if (swipeIntent === 'horizontal' && Math.abs(x) > Math.abs(y) && (Math.abs(x) > SWIPE_THRESHOLD || isFlick)) {
       if (x < 0) {
         nextCard()
       } else {
@@ -1687,40 +1774,82 @@
     resetSwipeState(event?.currentTarget)
   }
 
+  const handlePageTouchStart = (event) => {
+    if (event.target?.closest('.card-stage')) return
+    const touch = event.touches[0]
+    if (!touch) return
+    pageDrag = {
+      identifier: touch.identifier,
+      startY: touch.clientY,
+      lastY: touch.clientY,
+      scrollTop: scrollY,
+      velY: 0,
+      lastTime: performance.now(),
+    }
+    logTouchDebug({ lastEvent: 'page-touchstart' })
+  }
+
+  const handlePageTouchMove = (event) => {
+    if (!pageDrag) return
+    const touch = Array.from(event.changedTouches).find(t => t.identifier === pageDrag.identifier)
+    if (!touch) return
+    const now = performance.now()
+    const dt = now - pageDrag.lastTime
+    const dy = pageDrag.lastY - touch.clientY
+    if (dt > 0) pageDrag.velY = (dy / dt) * 16
+    pageDrag.lastY = touch.clientY
+    pageDrag.lastTime = now
+    applyScroll(pageDrag.scrollTop + (pageDrag.startY - touch.clientY))
+    logTouchDebug({ lastEvent: 'page-touchmove', intent: 'page-drag' })
+  }
+
+  const handlePageTouchEnd = (event) => {
+    if (!pageDrag) return
+    launchMomentumScroll(pageDrag.velY)
+    pageDrag = null
+    logTouchDebug({ lastEvent: 'page-touchend' })
+  }
+
+  // Mouse wheel and pointer drag for desktop browser testing
   const handlePagePointerDown = (event) => {
+    if (event.target?.closest('.card-stage')) return
+    console.log('[page-pd] type:', event.pointerType, 'xy:', event.clientX, event.clientY, 'btns:', event.buttons)
     if (!isMouseLikePointer(event.pointerType)) return
     if (event.buttons !== 1) return
-    if (event.target?.closest('.card-stage')) return
-    if (
-      event.target?.closest(
-        'button, input, select, textarea, a, label, summary, details, iframe, .hero-stats, .chart-stack, .header-actions',
-      )
-    ) {
-      return
-    }
+    // Capture pointer so iframes can't swallow pointermove during drag
+    try { mainEl?.setPointerCapture(event.pointerId) } catch (_) {}
     pageDrag = {
-      pointerId: event.pointerId,
+      identifier: event.pointerId,
       startY: event.clientY,
+      lastY: event.clientY,
       scrollTop: getScrollTop(),
+      velY: 0,
+      lastTime: performance.now(),
     }
-    event.preventDefault()
-    logTouchDebug({ pointerType: event.pointerType ?? 'mouse', lastEvent: 'page-pointerdown' })
   }
 
   const handlePagePointerMove = (event) => {
-    if (!pageDrag || pageDrag.pointerId !== event.pointerId) return
-    if (typeof window === 'undefined') return
+    if (!pageDrag || !isMouseLikePointer(event.pointerType)) return
     event.preventDefault()
-    const delta = event.clientY - pageDrag.startY
-    window.scrollTo({ top: pageDrag.scrollTop - delta })
-    logTouchDebug({ lastEvent: 'page-scroll', intent: 'page-drag' })
+    const now = performance.now()
+    const dt = now - pageDrag.lastTime
+    const dy = pageDrag.lastY - event.clientY
+    if (dt > 0) pageDrag.velY = (dy / dt) * 16
+    pageDrag.lastY = event.clientY
+    pageDrag.lastTime = now
+    applyScroll(pageDrag.scrollTop + (pageDrag.startY - event.clientY))
   }
 
   const handlePagePointerUp = (event) => {
-    if (pageDrag && pageDrag.pointerId === event.pointerId) {
-      pageDrag = null
-      logTouchDebug({ lastEvent: 'page-pointerup', intent: '' })
-    }
+    if (!isMouseLikePointer(event.pointerType)) return
+    if (pageDrag) launchMomentumScroll(pageDrag.velY)
+    pageDrag = null
+    try { mainEl?.releasePointerCapture(event.pointerId) } catch (_) {}
+  }
+
+  const handleWheel = (event) => {
+    event.preventDefault()
+    applyScroll(scrollY + event.deltaY)
   }
 
   const openKeypad = (module) => {
@@ -1875,12 +2004,11 @@
   ]
 </script>
 
-<main
-  on:pointerdown={handlePagePointerDown}
-  on:pointermove={handlePagePointerMove}
-  on:pointerup={handlePagePointerUp}
-  on:pointercancel={handlePagePointerUp}
-  on:pointerleave={handlePagePointerUp}
+<main bind:this={mainEl}
+  on:pointerdown|capture={handlePagePointerDown}
+  on:pointermove|capture={handlePagePointerMove}
+  on:pointerup|capture={handlePagePointerUp}
+  on:pointercancel|capture={handlePagePointerUp}
 >
   <section class="telemetry-pane">
     <header class="telemetry-header">
@@ -2043,14 +2171,14 @@
       class="card-stage"
       role="region"
       aria-label="Module carousel"
-      on:pointerdown={handlePointerDown}
-      on:pointermove={handlePointerMove}
-      on:pointerup={resolveSwipe}
-      on:pointercancel={resolveSwipe}
-      on:pointerleave={resolveSwipe}
+      on:pointerdown|stopPropagation={handlePointerDown}
+      on:pointermove|stopPropagation={handlePointerMove}
+      on:pointerup|stopPropagation={resolveSwipe}
+      on:pointercancel|stopPropagation={resolveSwipe}
+      on:pointerleave|stopPropagation={resolveSwipe}
     >
       {#if moduleCards.length}
-        <div class="card-track" style={`transform: translateX(-${activeIndex * 100}%);`}>
+        <div class="card-track" class:dragging={swipeIsActive} style={`transform: translateX(calc(-${activeIndex * 100}% + ${liveDragOffset}px));`}>
           {#each moduleCards as module (module.module_id)}
             <article class="module-card" class:active={module.module_id === activeModule?.module_id}>
               <header class="card-header">
@@ -2416,15 +2544,12 @@
     </div>
   {/if}
 
-  {#if ENABLE_TOUCH_DEBUG}
+  {#if true}
     <div class="touch-debug-panel">
-      <strong>Touch Debug</strong>
-      <p>Pointer: {touchDebug.pointerType || '—'}</p>
-      <p>Intent: {touchDebug.intent || '—'}</p>
-      <p>Capturing: {pointerCaptureActive ? 'yes' : 'no'}</p>
-      <p>Event: {touchDebug.lastEvent || '—'}</p>
-      <p>ΔX: {swipeDelta.x.toFixed(1)}</p>
-      <p>ΔY: {swipeDelta.y.toFixed(1)}</p>
+      <strong>Debug</strong>
+      {#each debugLines.split('\n') as line}
+        <p>{line}</p>
+      {/each}
     </div>
   {/if}
 
@@ -2437,18 +2562,21 @@
 </main>
 
 <style>
+:global(html) {
+  height: 100%;
+  overflow: hidden;
+}
+
 :global(body) {
   margin: 0;
+  height: 100%;
+  overflow: hidden;
   font-family: 'Space Grotesk', 'Helvetica Neue', sans-serif;
   background: #010812;
   color: #f3fbff;
-  min-height: 100vh;
   -webkit-user-select: none;
   user-select: none;
   -webkit-touch-callout: none;
-  overscroll-behavior: none;
-  overflow: auto;
-  touch-action: pan-y;
 }
 
 main,
@@ -2458,21 +2586,25 @@ main * {
 }
 
 main {
-  min-height: 100vh;
+  height: 100%;
+  overflow-y: scroll;
+  overflow-x: hidden;
+  -webkit-overflow-scrolling: touch;
   display: flex;
   flex-direction: column;
   gap: 1.5rem;
   padding: 1.25rem 1.25rem 2rem;
+  box-sizing: border-box;
   background:
     radial-gradient(circle at 20% 20%, rgba(20, 93, 255, 0.25), transparent 55%),
     radial-gradient(circle at 80% 0%, rgba(24, 255, 211, 0.2), transparent 50%),
     linear-gradient(180deg, rgba(2, 6, 22, 0.95), rgba(1, 3, 12, 0.98));
-  overflow-x: hidden;
-  touch-action: manipulation;
+  touch-action: pan-y;
 }
 
 .telemetry-pane,
 .controls-pane {
+  flex: 0 0 auto;
   background: rgba(2, 12, 24, 0.55);
   border: 1px solid rgba(91, 168, 255, 0.2);
   border-radius: 28px;
@@ -2661,6 +2793,7 @@ h3 {
 }
 
 .controls-pane {
+  margin-top: 0.5rem;
   min-height: 360px;
   display: flex;
   flex-direction: column;
@@ -2687,7 +2820,7 @@ h3 {
   position: relative;
   overflow: hidden;
   margin-top: 1rem;
-  touch-action: pan-y;
+  touch-action: none;
   -webkit-user-select: none;
   user-select: none;
 }
@@ -2696,7 +2829,14 @@ h3 {
   display: flex;
   width: 100%;
   height: 100%;
-  transition: transform 0.45s cubic-bezier(0.22, 1, 0.36, 1);
+  transition: transform 0.42s cubic-bezier(0.22, 1, 0.36, 1);
+  will-change: transform;
+  -webkit-backface-visibility: hidden;
+  backface-visibility: hidden;
+}
+
+.card-track.dragging {
+  transition: none;
 }
 
 .module-card {
@@ -3268,15 +3408,15 @@ h3 {
 
 .touch-debug-panel {
   position: fixed;
-  bottom: 1rem;
-  right: 1rem;
-  min-width: 180px;
-  background: rgba(0, 0, 0, 0.7);
-  border: 1px solid rgba(0, 255, 200, 0.4);
+  top: 0.5rem;
+  left: 0.5rem;
+  min-width: 200px;
+  background: rgba(0, 0, 0, 0.92);
+  border: 2px solid rgba(0, 255, 200, 0.9);
   border-radius: 12px;
   padding: 0.75rem 1rem;
   font-size: 0.85rem;
-  z-index: 20;
+  z-index: 9999;
   pointer-events: none;
   color: #f3fbff;
 }
